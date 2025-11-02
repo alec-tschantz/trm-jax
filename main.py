@@ -3,60 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
 import equinox as eqx
 import jax
-import jax.numpy as jnp
 import optax
 
-from model import Config as ModelConfig, Model
+from dataset import AdditionDataset, AdditionDatasetConfig
 from losses import act_loss
-
-
-class Dataset:
-    """
-    Minimal stub: returns a dict with
-      - "inputs": int32 tokens [B, T]
-      - "labels": int32 tokens [B, T]
-      - "input_mask": bool mask [B, T]
-      - "output_mask": bool mask [B, T]
-      - "task_tokens": int32 ids [B]
-    Replace this with your real dataset later.
-    """
-
-    def __init__(
-        self,
-        batch_size: int,
-        seq_len: int,
-        vocab_size: int,
-        num_task_embeddings: int,
-        input_mask_keep_prob: float = 0.9,
-        output_mask_keep_prob: float = 0.8,
-    ):
-        self.B = batch_size
-        self.T = seq_len
-        self.V = vocab_size
-        self.NT = num_task_embeddings
-        self.input_mask_keep_prob = input_mask_keep_prob
-        self.output_mask_keep_prob = output_mask_keep_prob
-
-    def sample(self, key: jax.random.PRNGKey):
-        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
-        inputs = jax.random.randint(k1, (self.B, self.T), 0, self.V, dtype=jnp.int32)
-        labels = jax.random.randint(k2, (self.B, self.T), 0, self.V, dtype=jnp.int32)
-        input_mask = (
-            jax.random.uniform(k3, (self.B, self.T)) < self.input_mask_keep_prob
-        ).astype(jnp.bool_)
-        output_mask = (
-            jax.random.uniform(k4, (self.B, self.T)) < self.output_mask_keep_prob
-        ).astype(jnp.bool_)
-        task_tokens = jax.random.randint(k5, (self.B,), 0, self.NT, dtype=jnp.int32)
-        return {
-            "inputs": inputs,
-            "labels": labels,
-            "input_mask": input_mask,
-            "output_mask": output_mask,
-            "task_tokens": task_tokens,
-        }
+from model import Config as ModelConfig, Model
 
 
 # -------------------------
@@ -79,6 +33,8 @@ class TrainConfig:
     weight_decay: float = 0.01
     beta1: float = 0.9
     beta2: float = 0.95
+    max_addend: int = 9
+    grad_clip_norm: float = 1.0
 
 
 # -------------------------
@@ -115,11 +71,14 @@ def make_optimizer(cfg: TrainConfig):
         min_ratio=cfg.lr_min_ratio,
     )
 
-    tx = optax.adamw(
-        learning_rate=sched,
-        b1=cfg.beta1,
-        b2=cfg.beta2,
-        weight_decay=cfg.weight_decay,
+    tx = optax.chain(
+        optax.clip_by_global_norm(cfg.grad_clip_norm),
+        optax.adamw(
+            learning_rate=sched,
+            b1=cfg.beta1,
+            b2=cfg.beta2,
+            weight_decay=cfg.weight_decay,
+        ),
     )
     return tx
 
@@ -156,15 +115,15 @@ def make_train_step(tx):
 # -------------------------
 def main():
     # ----- config -----
-    B = 8
-    T = 32
-    V = 1024
+    B = 64
+    T = 5
+    V = 11
     cfg = TrainConfig(
         model=ModelConfig(
             batch_size=B,
             seq_len=T,
             task_embedding_dim=512,
-            num_task_embeddings=64,
+            num_task_embeddings=1,
             vocab_size=V,
             H_cycles=3,
             L_cycles=6,
@@ -173,10 +132,10 @@ def main():
             expansion=4.0,
             num_heads=8,
             rope_theta=10000.0,
-            halt_max_steps=16,
+            halt_max_steps=4,
             halt_exploration_prob=0.1,
-            forward_dtype="bfloat16",
-            task_token_length=16,
+            forward_dtype="float32",
+            task_token_length=1,
         ),
         epochs=1,
         steps_per_epoch=200,
@@ -187,6 +146,7 @@ def main():
         weight_decay=0.01,
         beta1=0.9,
         beta2=0.95,
+        max_addend=9,
     )
 
     # ----- rng, model, optimizer -----
@@ -197,13 +157,14 @@ def main():
     tx = make_optimizer(cfg)
     opt_state = tx.init(model)
 
-    # ----- dataset stub -----
-    dataset = Dataset(
+    # ----- dataset -----
+    data_cfg = AdditionDatasetConfig(
         batch_size=cfg.model.batch_size,
         seq_len=cfg.model.seq_len,
+        max_addend=cfg.max_addend,
         vocab_size=cfg.model.vocab_size,
-        num_task_embeddings=cfg.model.num_task_embeddings,
     )
+    dataset = AdditionDataset(data_cfg)
 
     # ----- training loop -----
     train_step = make_train_step(tx)

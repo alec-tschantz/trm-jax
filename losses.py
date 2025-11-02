@@ -97,8 +97,8 @@ def act_loss(
     preds = jnp.argmax(outputs["logits"], axis=-1)
 
     # Mask & per-sequence divisor
-    loss_counts = output_mask.sum(axis=-1)  # [B]
-    loss_divisor = jnp.clip(loss_counts, a_min=1)[:, None]  # [B,1]
+    loss_counts = output_mask.sum(axis=-1).astype(jnp.int32)  # [B]
+    loss_divisor = jnp.maximum(loss_counts, 1)[:, None].astype(jnp.float32)  # [B,1]
 
     # Token-level correctness and exact sequence correctness
     is_correct = (preds == labels) & output_mask  # [B,S]
@@ -121,20 +121,21 @@ def act_loss(
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
     lm_loss = jnp.sum(token_losses / loss_divisor)  # sum over batch (per-seq averaged)
-    q_halt_loss = bce_with_logits_sum(outputs["q_halt_logits"], seq_is_correct)
+    q_halt_logits = jnp.clip(outputs["q_halt_logits"], -30.0, 30.0)
+    q_halt_loss = bce_with_logits_sum(q_halt_logits, seq_is_correct)
 
     total_loss = lm_loss + 0.5 * q_halt_loss
 
-    # Metrics 
+    # Metrics
     # accuracy over valid tokens, averaged per-seq then summed for valid_metrics
     per_seq_acc = (
-        is_correct.astype(jnp.float32) / jnp.clip(loss_divisor, a_min=1)
+        is_correct.astype(jnp.float32) / loss_divisor
     ).sum(axis=-1)
     metrics["count"] = valid_metrics.sum()
     metrics["accuracy"] = jnp.where(valid_metrics, per_seq_acc, 0.0).sum()
     metrics["exact_accuracy"] = (valid_metrics & seq_is_correct).sum()
     metrics["q_halt_accuracy"] = (
-        valid_metrics & ((outputs["q_halt_logits"] >= 0.0) == seq_is_correct)
+        valid_metrics & ((q_halt_logits >= 0.0) == seq_is_correct)
     ).sum()
     metrics["steps"] = jnp.where(valid_metrics, new_carry.steps, 0).sum()
 

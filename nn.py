@@ -139,6 +139,10 @@ class RotaryEmbedding(eqx.Module):
         self.max_position_embeddings = int(max_position_embeddings)
 
     def __call__(self, seq_len: int) -> CosSin:
+        if seq_len > self.max_position_embeddings:
+            raise ValueError(
+                f"seq_len={seq_len} exceeds rotary cache of {self.max_position_embeddings}"
+            )
         t = jnp.arange(seq_len, dtype=jnp.float32)
         freqs = jnp.outer(t, jnp.asarray(self.inv_freq))  # [S, dim/2]
         emb = jnp.concatenate([freqs, freqs], axis=-1)  # [S, dim]
@@ -158,17 +162,19 @@ def _scaled_dot_product_attention(
     kf = key.astype(jnp.float32)
     vf = value.astype(jnp.float32)
     scores = jnp.einsum("bhqd,bhkd->bhqk", qf, kf) * (1.0 / math.sqrt(d))
-    neg_inf = jnp.array(-1e9, dtype=scores.dtype)
+    neg_limit = jnp.array(-60.0, dtype=scores.dtype)
+    pos_limit = jnp.array(60.0, dtype=scores.dtype)
     if attention_mask is not None:
         key_mask = attention_mask[:, None, None, :].astype(bool)
-        scores = jnp.where(key_mask, scores, neg_inf)
+        scores = jnp.where(key_mask, scores, neg_limit)
     S = scores.shape[-1]
     causal_mask = jnp.triu(jnp.ones((S, S), dtype=bool), k=1)
     scores = jnp.where(
         causal_mask[None, None, :, :],
-        jnp.full_like(scores, neg_inf),
+        jnp.full_like(scores, neg_limit),
         scores,
     )
+    scores = jnp.clip(scores, a_min=neg_limit, a_max=pos_limit)
     attn = jax.nn.softmax(scores, axis=-1)
     out = jnp.einsum("bhqk,bhkd->bhqd", attn, vf)
     if attention_mask is not None:
