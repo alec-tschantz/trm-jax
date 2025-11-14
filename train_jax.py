@@ -70,7 +70,8 @@ DEFAULT_CONFIG = TrainConfig(
         num_heads=8,
         expansion=4,
         puzzle_emb_ndim=512,
-        forward_dtype="bfloat16",
+        # JAX: run forward in float32 to keep jit+grad numerically stable.
+        forward_dtype="float32",
         puzzle_emb_len=16,
     ),
 )
