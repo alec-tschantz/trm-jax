@@ -251,7 +251,7 @@ class Inner(eqx.Module):
         def step(carry, _):
             zH, zL = carry
             inj = (zH + inp).astype(self.forward_dtype)
-            zL = self._run_L(z_L, inj, cos_sin)
+            zL = self._run_L(zL, inj, cos_sin)
             zH = self.L_level(zH, zL, cos_sin).astype(self.forward_dtype)
             return (jax.lax.stop_gradient(zH), jax.lax.stop_gradient(zL)), None
 

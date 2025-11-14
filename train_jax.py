@@ -20,6 +20,8 @@ from trm_jax.model import Carry, Model
 from trm_jax.ema import EMAHelper
 
 jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_debug_nans", True)
+jax.config.update("jax_debug_infs", True)
 
 @dataclass
 class TrainConfig:
