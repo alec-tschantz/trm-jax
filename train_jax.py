@@ -242,7 +242,9 @@ def train_loop(config: TrainConfig):
     ema_helper.register(train_state.model)
 
     @eqx.filter_jit
-    def train_step(model, opt_state, carry, batch, rng, lr_scale):
+    def train_step(model, opt_state, carry, batch, rng, lr_scale, global_batch_size):
+        gb = jnp.asarray(global_batch_size, dtype=jnp.float32)
+
         def loss_fn(model):
             prepared_carry = prepare_carry(model, carry, batch)
             new_carry, loss, metrics, _, _ = act_loss(
@@ -252,15 +254,15 @@ def train_loop(config: TrainConfig):
                 return_keys=(),
                 training=True,
             )
-            return loss, (new_carry, metrics)
+            return loss / gb, (new_carry, metrics, loss)
 
-        (loss, (new_carry, metrics)), grads = eqx.filter_value_and_grad(
+        (scaled_loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
             loss_fn, has_aux=True
         )(model)
         updates, opt_state = optimizer.update(grads, opt_state, model)
         updates = jax.tree_util.tree_map(lambda u: lr_scale * u, updates)
         model = eqx.apply_updates(model, updates)
-        return model, opt_state, new_carry, loss, metrics
+        return model, opt_state, new_carry, unscaled_loss, metrics
 
     for _, batch, global_batch_size in train_loader:
         if train_state.step >= train_state.total_steps:
@@ -284,6 +286,7 @@ def train_loop(config: TrainConfig):
             batch_jnp,
             step_rng,
             lr_this_step,
+            global_batch_size,
         )
         train_state.step += 1
         train_state.rng = rng

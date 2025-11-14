@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
+
+from trm_jax.utils import trunc_normal
 
 
 class CastedSparseEmbedding(eqx.Module):
-    embedding: eqx.nn.Embedding
+    weight: jnp.ndarray
     cast_to: jnp.dtype = eqx.field(static=True)
 
     def __init__(
@@ -14,14 +15,18 @@ class CastedSparseEmbedding(eqx.Module):
         num_embeddings: int,
         embedding_dim: int,
         *,
+        init_std: float,
         key,
         cast_to=jnp.float32,
     ):
-        self.embedding = eqx.nn.Embedding(num_embeddings, embedding_dim, key=key)
+        if init_std == 0.0:
+            weight = jnp.zeros((num_embeddings, embedding_dim), dtype=jnp.float32)
+        else:
+            weight = trunc_normal(key, (num_embeddings, embedding_dim), std=init_std)
+        self.weight = weight.astype(jnp.float32)
         self.cast_to = cast_to
 
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
-        flat_inputs = inputs.reshape(-1)
-        embedded = jax.vmap(self.embedding)(flat_inputs)
-        output_dim = embedded.shape[-1]
-        return embedded.reshape(*inputs.shape, output_dim).astype(self.cast_to)
+        idx = inputs.astype(jnp.int32)
+        embedded = self.weight[idx]
+        return embedded.astype(self.cast_to)

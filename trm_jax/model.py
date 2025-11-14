@@ -1,11 +1,11 @@
 from __future__ import annotations
+import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 from pydantic import BaseModel
 
 from trm_jax.layers import (
@@ -60,7 +60,7 @@ class ModelConfig(BaseModel):
     rope_theta: float = 10000.0
     halt_max_steps: int
     halt_exploration_prob: float
-    forward_dtype: str = "float32"
+    forward_dtype: str = "bfloat16"
     puzzle_emb_len: int = 16
 
 
@@ -137,21 +137,23 @@ class Inner(eqx.Module):
     puzzle_emb: CastedSparseEmbedding
     rotary_emb: RotaryEmbedding
     L_level: ReasoningModule
-    H_init: np.ndarray
-    L_init: np.ndarray
+    H_init: jnp.ndarray
+    L_init: jnp.ndarray
 
     def __init__(self, config: ModelConfig, *, key):
         self.config = config
         dtype = getattr(jnp, config.forward_dtype)
         self.forward_dtype = dtype
-        self.embed_scale = float(jnp.sqrt(config.hidden_size))
+        self.embed_scale = math.sqrt(config.hidden_size)
         self.puzzle_emb_len = config.puzzle_emb_len
+        embed_init_std = 1.0 / self.embed_scale
 
         k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
 
         self.embed_tokens = CastedEmbedding(
             config.vocab_size,
             config.hidden_size,
+            init_std=embed_init_std,
             key=k1,
             cast_to=dtype,
         )
@@ -161,11 +163,17 @@ class Inner(eqx.Module):
             bias=False,
             key=k2,
         )
-        self.q_head = CastedLinear(config.hidden_size, 1, bias=True, key=k3)
+        q_head = CastedLinear(config.hidden_size, 1, bias=True, key=k3)
+        q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
+        if q_head.bias is not None:
+            bias_val = jnp.full_like(q_head.bias, -5.0)
+            q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
+        self.q_head = q_head
 
         self.puzzle_emb = CastedSparseEmbedding(
             config.num_puzzle_identifiers,
             config.puzzle_emb_ndim,
+            init_std=0.0,
             cast_to=dtype,
             key=k4,
         )
@@ -181,8 +189,8 @@ class Inner(eqx.Module):
             tuple(Block(config, key=kk) for kk in layer_keys)
         )
 
-        self.H_init = np.array(trunc_normal(k6, (config.hidden_size,), std=1.0))
-        self.L_init = np.array(trunc_normal(k7, (config.hidden_size,), std=1.0))
+        self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
+        self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
 
     # ------------------------------------------------------------
     # Embeddings
@@ -213,8 +221,8 @@ class Inner(eqx.Module):
 
     def reset_carry(self, reset, c):
         flag = reset.reshape((-1, 1, 1))
-        h0 = jnp.asarray(self.H_init, dtype=self.forward_dtype)[None, None, :]
-        l0 = jnp.asarray(self.L_init, dtype=self.forward_dtype)[None, None, :]
+        h0 = self.H_init[None, None, :]
+        l0 = self.L_init[None, None, :]
         zH = jnp.where(flag, h0, c.z_H)
         zL = jnp.where(flag, l0, c.z_L)
         return InnerCarry(z_H=zH, z_L=zL)

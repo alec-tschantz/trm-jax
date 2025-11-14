@@ -35,36 +35,54 @@ def apply_rotary_pos_emb(
 
 
 class CastedLinear(eqx.Module):
-    linear: eqx.nn.Linear
+    weight: jnp.ndarray
+    bias: jnp.ndarray | None
+    use_bias: bool = eqx.field(static=True)
 
     def __init__(self, in_features: int, out_features: int, *, bias: bool, key):
-        self.linear = eqx.nn.Linear(
-            in_features,
-            out_features,
-            use_bias=bias,
-            key=key,
+        std = 1.0 / math.sqrt(in_features)
+        self.weight = trunc_normal(key, (out_features, in_features), std=std).astype(
+            jnp.float32
         )
+        self.use_bias = bias
+        if bias:
+            self.bias = jnp.zeros((out_features,), dtype=jnp.float32)
+        else:
+            self.bias = None
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        orig_shape = x.shape[:-1]
-        x_flat = x.reshape(-1, x.shape[-1])
-        out = jax.vmap(self.linear)(x_flat)
-        return out.reshape(*orig_shape, out.shape[-1]).astype(x.dtype)
+        dtype = x.dtype
+        weight = jnp.transpose(self.weight.astype(dtype), (1, 0))
+        out = jnp.matmul(x, weight)
+        if self.bias is not None:
+            out = out + self.bias.astype(dtype)
+        return out
 
 
 class CastedEmbedding(eqx.Module):
-    embedding: eqx.nn.Embedding
+    weight: jnp.ndarray
     cast_to: jnp.dtype = eqx.field(static=True)
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, *, key, cast_to=jnp.float32):
-        self.embedding = eqx.nn.Embedding(num_embeddings, embedding_dim, key=key)
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        init_std: float,
+        key,
+        cast_to=jnp.float32,
+    ):
+        if init_std == 0.0:
+            weight = jnp.zeros((num_embeddings, embedding_dim), dtype=jnp.float32)
+        else:
+            weight = trunc_normal(key, (num_embeddings, embedding_dim), std=init_std)
+        self.weight = weight.astype(jnp.float32)
         self.cast_to = cast_to
 
     def __call__(self, input: jnp.ndarray) -> jnp.ndarray:
-        flat = input.reshape(-1)
-        embeds = jax.vmap(self.embedding)(flat)
-        out_dim = embeds.shape[-1]
-        return embeds.reshape(*input.shape, out_dim).astype(self.cast_to)
+        idx = input.astype(jnp.int32)
+        embeds = self.weight[idx]
+        return embeds.astype(self.cast_to)
 
 
 class RotaryEmbedding(eqx.Module):
