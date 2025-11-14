@@ -94,9 +94,7 @@ class RotaryEmbedding(eqx.Module):
     sin_cached: jnp.ndarray
 
     def __init__(self, dim: int, max_position_embeddings: int, base: float):
-        inv_freq = 1.0 / (
-            base**(jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
-        )
+        inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
         t = jnp.arange(max_position_embeddings, dtype=jnp.float32)
         freqs = jnp.einsum("i,j->ij", t, inv_freq)
         emb = jnp.concatenate([freqs, freqs], axis=-1)
@@ -130,55 +128,60 @@ class Attention(eqx.Module):
     ):
         self.hidden_size = hidden_size
         self.head_dim = head_dim
-        self.output_size = head_dim * num_heads
+        self.output_size = num_heads * head_dim
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
-        q_key, o_key = jax.random.split(key)
+
+        k_qkv, k_o = jax.random.split(key)
         self.qkv_proj = CastedLinear(
             hidden_size,
             (num_heads + 2 * num_key_value_heads) * head_dim,
             bias=False,
-            key=q_key,
+            key=k_qkv,
         )
-        self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False, key=o_key)
+        self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False, key=k_o)
 
     def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray) -> jnp.ndarray:
-        orig_dtype = hidden_states.dtype
-        batch_size, seq_len, _ = hidden_states.shape
+        out_dtype = hidden_states.dtype
+        b, s, _ = hidden_states.shape
+
         qkv = self.qkv_proj(hidden_states)
         qkv = qkv.reshape(
-            batch_size,
-            seq_len,
-            self.num_heads + 2 * self.num_key_value_heads,
-            self.head_dim,
+            b, s, self.num_heads + 2 * self.num_key_value_heads, self.head_dim
         )
-        query = qkv[:, :, : self.num_heads]
-        key = qkv[
-            :, :, self.num_heads : self.num_heads + self.num_key_value_heads
-        ]
-        value = qkv[:, :, self.num_heads + self.num_key_value_heads :]
+
+        q = qkv[:, :, : self.num_heads]
+        k = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
+        v = qkv[:, :, self.num_heads + self.num_key_value_heads :]
 
         if cos_sin is not None:
             cos, sin = cos_sin
-            cos = cos[:seq_len]
-            sin = sin[:seq_len]
-            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+            cos = cos[:s]
+            sin = sin[:s]
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        query_f = query.astype(jnp.float32)
-        key_f = key.astype(jnp.float32)
-        value_f = value.astype(jnp.float32)
+        q = q.astype(jnp.float32)
+        k = k.astype(jnp.float32)
+        v = v.astype(jnp.float32)
+
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn_scores = jnp.einsum("bthd, bshd -> bhts", query_f, key_f) * scale
+        attn_scores = jnp.einsum("bthd,bshd->bhts", q, k) * scale
+
         if self.causal:
-            mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-            neg_inf = jnp.full_like(attn_scores, -1e9)
-            attn_scores = jnp.where(mask[None, None, :, :], attn_scores, neg_inf)
-        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-        attn_output = jnp.einsum("bhts, bshd -> bthd", attn_weights, value_f)
-        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)
-        attn_output = attn_output.astype(orig_dtype)
-        return self.o_proj(attn_output)
+            mask = jnp.tril(jnp.ones((s, s), dtype=bool))
+            attn_scores = jnp.where(
+                mask[None, None, :, :],
+                attn_scores,
+                jnp.full_like(attn_scores, -1e30),
+            )
+
+        attn = jax.nn.softmax(attn_scores, axis=-1)
+        out = jnp.einsum("bhts,bshd->bthd", attn, v)
+        out = out.reshape(b, s, self.output_size)
+
+        out = out.astype(out_dtype)
+        return self.o_proj(out)
 
 
 class SwiGLU(eqx.Module):
@@ -192,7 +195,9 @@ class SwiGLU(eqx.Module):
         self.expansion = expansion
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
         gate_key, down_key = jax.random.split(key)
-        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False, key=gate_key)
+        self.gate_up_proj = CastedLinear(
+            hidden_size, inter * 2, bias=False, key=gate_key
+        )
         self.down_proj = CastedLinear(inter, hidden_size, bias=False, key=down_key)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:

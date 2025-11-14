@@ -233,9 +233,10 @@ class Inner(eqx.Module):
     def _run_L(self, z_L, inj, cos_sin):
         z_L = z_L.astype(self.forward_dtype)
         inj = inj.astype(self.forward_dtype)
+
         def step(h, _):
-            out = self.L_level(h, inj, cos_sin)
-            return out.astype(h.dtype), None
+            out = self.L_level(h, inj, cos_sin).astype(self.forward_dtype)
+            return out, None
 
         z_L, _ = jax.lax.scan(step, z_L, xs=None, length=self.config.L_cycles)
         return z_L
@@ -248,16 +249,22 @@ class Inner(eqx.Module):
         z_H = z_H.astype(self.forward_dtype)
         z_L = z_L.astype(self.forward_dtype)
         inp = inp.astype(self.forward_dtype)
+
         def step(carry, _):
             zH, zL = carry
             inj = (zH + inp).astype(self.forward_dtype)
-            zL = self._run_L(zL, inj, cos_sin)
-            zH = self.L_level(zH, zL, cos_sin).astype(self.forward_dtype)
-            return (jax.lax.stop_gradient(zH), jax.lax.stop_gradient(zL)), None
+
+            zL_new = self._run_L(zL, inj, cos_sin)
+            zH_new = self.L_level(zH, zL_new, cos_sin).astype(self.forward_dtype)
+
+            zH_new = jax.lax.stop_gradient(zH_new)
+            zL_new = jax.lax.stop_gradient(zL_new)
+
+            return (zH_new, zL_new), None
 
         if self.config.H_cycles > 1:
             (z_H, z_L), _ = jax.lax.scan(
-                step, (z_H, z_L), xs=None, length=self.config.H_cycles - 1
+                step, (z_H, z_L), None, length=self.config.H_cycles - 1
             )
 
         return z_H, z_L
@@ -269,12 +276,11 @@ class Inner(eqx.Module):
     def __call__(self, carry, batch):
         cos_sin = self.rotary_emb()
         inp = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+
         z_H, z_L = carry.z_H, carry.z_L
 
-        # H-1 cycles
         z_H, z_L = self._run_H(z_H, z_L, inp, cos_sin)
 
-        # Final H-cycle
         inj = (z_H + inp).astype(self.forward_dtype)
         z_L = self._run_L(z_L, inj, cos_sin)
         z_H = self.L_level(z_H, z_L, cos_sin).astype(self.forward_dtype)
@@ -286,6 +292,7 @@ class Inner(eqx.Module):
 
         logits = self.lm_head(z_H).astype(jnp.float32)[:, self.puzzle_emb_len :, :]
         qh = self.q_head(z_H[:, 0]).astype(jnp.float32).squeeze(-1)
+
         return new_carry, logits, qh
 
 
