@@ -15,7 +15,7 @@ def stablemax_cross_entropy(
     ignore_index: int = IGNORE_LABEL_ID,
     valid_mask: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    logprobs = jnn.log_softmax(logits.astype(jnp.float64), axis=-1)
+    logprobs = jnn.log_softmax(logits.astype(jnp.float32), axis=-1)
     if valid_mask is None:
         valid_mask = labels != ignore_index
     transformed_labels = jnp.where(valid_mask, labels, 0)

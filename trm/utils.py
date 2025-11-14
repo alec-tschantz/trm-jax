@@ -36,4 +36,3 @@ def trunc_normal(
     upper_scaled = upper / std
     samples = jax.random.truncated_normal(key, lower_scaled, upper_scaled, shape)
     return samples * std
-

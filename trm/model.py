@@ -192,7 +192,7 @@ class Inner(eqx.Module):
         puzz = self.puzzle_emb(puzzle_ids)
         need = self.puzzle_emb_len * self.config.hidden_size - puzz.shape[-1]
         if need > 0:
-            puzz = jnp.pad(puzz, ((0, 0), (0, need)))  # pad feature dim
+            puzz = jnp.pad(puzz, ((0, 0), (0, need)))
 
         puzz = puzz.reshape(-1, self.puzzle_emb_len, self.config.hidden_size)
         emb = jnp.concatenate([puzz, tok], axis=1)
@@ -255,11 +255,9 @@ class Inner(eqx.Module):
 
             return (zH_new, zL_new), None
 
-        if self.config.H_cycles > 1:
-            (z_H, z_L), _ = jax.lax.scan(
-                step, (z_H, z_L), xs=None, length=self.config.H_cycles - 1
-            )
-
+        (z_H, z_L), _ = jax.lax.scan(
+            step, (z_H, z_L), xs=None, length=self.config.H_cycles - 1
+        )
         return z_H, z_L
 
     def __call__(self, carry: InnerCarry, batch: Dict[str, jnp.ndarray]):

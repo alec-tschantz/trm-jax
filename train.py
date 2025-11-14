@@ -18,8 +18,6 @@ from trm.model import Carry, Model
 from trm.utils import EMAHelper
 from trm.optim import adam_atan2, sparse_sign_sgd
 
-jax.config.update("jax_enable_x64", True)
-
 
 @dataclass
 class TrainConfig:
