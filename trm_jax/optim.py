@@ -13,6 +13,10 @@ class AdamAtan2State(NamedTuple):
     exp_avg_sq: Any
 
 
+class SparseSignSGDState(NamedTuple):
+    pass
+
+
 def adam_atan2(
     *,
     beta1: float = 0.9,
@@ -59,11 +63,12 @@ def adam_atan2(
         bias_c2 = 1.0 - beta2**count
 
         def compute_update(m, v, g, p):
-            if (m is None) or (p is None):
+            if (m is None) or (v is None) or (p is None):
                 return None
             m_hat = m / bias_c1
             v_hat = v / bias_c2
-            denom = jnp.sqrt(v_hat * (b * b) + 1e-10)
+            v_hat = jnp.maximum(v_hat, 0.0)
+            denom = jnp.sqrt(v_hat * (b * b) + 1e-12)
             atan_val = jnp.arctan2(m_hat, denom)
             return -(a * atan_val + weight_decay * p)
 
@@ -74,10 +79,6 @@ def adam_atan2(
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-class SparseSignSGDState(NamedTuple):
-    pass
-
-
 def sparse_sign_sgd(*, weight_decay: float = 0.0) -> optax.GradientTransformation:
     weight_decay = jnp.asarray(weight_decay)
 
@@ -85,15 +86,13 @@ def sparse_sign_sgd(*, weight_decay: float = 0.0) -> optax.GradientTransformatio
         return SparseSignSGDState()
 
     def update_fn(grads, state, params):
-        if params is None:
-            raise ValueError("Parameters must be provided to sparse_sign_sgd update.")
-
         def compute_update(g, p):
             if (g is None) or (p is None):
                 return None
-            mask = jnp.any(g != 0.0, axis=-1, keepdims=True)
+            finite_grad = jnp.where(jnp.isfinite(g), g, 0.0)
+            mask = jnp.any(finite_grad != 0.0, axis=-1, keepdims=True)
             mask = mask.astype(p.dtype)
-            signed = jnp.sign(g)
+            signed = jnp.sign(finite_grad)
             return -mask * (signed + weight_decay * p)
 
         updates = jax.tree.map(compute_update, grads, params)

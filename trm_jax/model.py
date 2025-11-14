@@ -21,28 +21,6 @@ from trm_jax.sparse_embedding import CastedSparseEmbedding
 from trm_jax.utils import trunc_normal
 
 
-# ------------------------------------------------------------
-# Carries
-# ------------------------------------------------------------
-
-
-class InnerCarry(eqx.Module):
-    z_H: jnp.ndarray
-    z_L: jnp.ndarray
-
-
-class Carry(eqx.Module):
-    inner_carry: InnerCarry
-    steps: jnp.ndarray
-    halted: jnp.ndarray
-    current_data: Dict[str, jnp.ndarray]
-
-
-# ------------------------------------------------------------
-# Config
-# ------------------------------------------------------------
-
-
 class ModelConfig(BaseModel):
     batch_size: int
     seq_len: int
@@ -64,9 +42,16 @@ class ModelConfig(BaseModel):
     puzzle_emb_len: int = 16
 
 
-# ------------------------------------------------------------
-# Block
-# ------------------------------------------------------------
+class InnerCarry(eqx.Module):
+    z_H: jnp.ndarray
+    z_L: jnp.ndarray
+
+
+class Carry(eqx.Module):
+    inner_carry: InnerCarry
+    steps: jnp.ndarray
+    halted: jnp.ndarray
+    current_data: Dict[str, jnp.ndarray]
 
 
 class Block(eqx.Module):
@@ -103,11 +88,6 @@ class Block(eqx.Module):
         return _block(h)
 
 
-# ------------------------------------------------------------
-# ReasoningModule
-# ------------------------------------------------------------
-
-
 class ReasoningModule(eqx.Module):
     layers: Tuple[Block, ...]
 
@@ -118,11 +98,6 @@ class ReasoningModule(eqx.Module):
         for layer in self.layers:
             h = layer(cos_sin, h)
         return h
-
-
-# ------------------------------------------------------------
-# Inner
-# ------------------------------------------------------------
 
 
 class Inner(eqx.Module):
@@ -191,10 +166,6 @@ class Inner(eqx.Module):
         self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
         self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
 
-    # ------------------------------------------------------------
-    # Embeddings
-    # ------------------------------------------------------------
-
     def _input_embeddings(self, inputs, puzzle_ids):
         tok = self.embed_tokens(inputs.astype(jnp.int32))
         puzz = self.puzzle_emb(puzzle_ids)
@@ -206,10 +177,6 @@ class Inner(eqx.Module):
         puzz = puzz.reshape(-1, self.puzzle_emb_len, self.config.hidden_size)
         emb = jnp.concatenate([puzz, tok], axis=1)
         return (emb * self.embed_scale).astype(self.forward_dtype)
-
-    # ------------------------------------------------------------
-    # Carry helpers
-    # ------------------------------------------------------------
 
     def empty_carry(self, bs):
         z = jnp.zeros(
@@ -226,10 +193,6 @@ class Inner(eqx.Module):
         zL = jnp.where(flag, l0, c.z_L)
         return InnerCarry(z_H=zH, z_L=zL)
 
-    # ------------------------------------------------------------
-    # L-cycle via scan
-    # ------------------------------------------------------------
-
     def _run_L(self, z_L, inj, cos_sin):
         z_L = z_L.astype(self.forward_dtype)
         inj = inj.astype(self.forward_dtype)
@@ -240,10 +203,6 @@ class Inner(eqx.Module):
 
         z_L, _ = jax.lax.scan(step, z_L, xs=None, length=self.config.L_cycles)
         return z_L
-
-    # ------------------------------------------------------------
-    # H-cycle via scan (H-1 iterations)
-    # ------------------------------------------------------------
 
     def _run_H(self, z_H, z_L, inp, cos_sin):
         z_H = z_H.astype(self.forward_dtype)
@@ -269,10 +228,6 @@ class Inner(eqx.Module):
 
         return z_H, z_L
 
-    # ------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------
-
     def __call__(self, carry, batch):
         cos_sin = self.rotary_emb()
         inp = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
@@ -294,11 +249,6 @@ class Inner(eqx.Module):
         qh = self.q_head(z_H[:, 0]).astype(jnp.float32).squeeze(-1)
 
         return new_carry, logits, qh
-
-
-# ------------------------------------------------------------
-# Model
-# ------------------------------------------------------------
 
 
 class Model(eqx.Module):
