@@ -165,9 +165,8 @@ class Inner(eqx.Module):
         )
         q_head = CastedLinear(config.hidden_size, 1, bias=True, key=k3)
         q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
-        if q_head.bias is not None:
-            bias_val = jnp.full_like(q_head.bias, -5.0)
-            q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
+        bias_val = jnp.full_like(q_head.bias, -5.0)
+        q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
         self.q_head = q_head
 
         self.puzzle_emb = CastedSparseEmbedding(
@@ -232,6 +231,8 @@ class Inner(eqx.Module):
     # ------------------------------------------------------------
 
     def _run_L(self, z_L, inj, cos_sin):
+        z_L = z_L.astype(self.forward_dtype)
+        inj = inj.astype(self.forward_dtype)
         def step(h, _):
             out = self.L_level(h, inj, cos_sin)
             return out.astype(h.dtype), None
@@ -244,6 +245,9 @@ class Inner(eqx.Module):
     # ------------------------------------------------------------
 
     def _run_H(self, z_H, z_L, inp, cos_sin):
+        z_H = z_H.astype(self.forward_dtype)
+        z_L = z_L.astype(self.forward_dtype)
+        inp = inp.astype(self.forward_dtype)
         def step(carry, _):
             zH, zL = carry
             inj = (zH + inp).astype(self.forward_dtype)
