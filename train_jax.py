@@ -18,6 +18,7 @@ from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from trm_jax.losses import act_loss
 from trm_jax.model import Carry, Model
 from trm_jax.ema import EMAHelper
+from trm_jax.optim import adam_atan2, sparse_sign_sgd
 
 jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_debug_nans", True)
@@ -79,7 +80,8 @@ DEFAULT_CONFIG = TrainConfig(
 
 @dataclass
 class TrainState:
-    model: Model
+    params: eqx.Module
+    static: eqx.Module
     opt_state: optax.OptState
     carry: Carry | None
     step: int
@@ -121,15 +123,31 @@ def create_model(
     )
     key = jax.random.PRNGKey(config.seed)
     model = Model(model_cfg, key=key)
-    optimizer = optax.adamw(
-        learning_rate=1.0,
-        weight_decay=config.weight_decay,
-        b1=config.beta1,
-        b2=config.beta2,
-    )
-    params, _ = eqx.partition(model, eqx.is_array)
+    params, static = eqx.partition(model, eqx.is_array)
+
+    def build_param_labels(p):
+        labels = jax.tree.map(lambda _: 0, p)
+        labels = eqx.tree_at(
+            lambda tree: tree.inner.puzzle_emb.weight,
+            labels,
+            1,
+        )
+        return labels
+
+    param_labels = build_param_labels(params)
+
+    transforms = {
+        0: adam_atan2(
+            beta1=config.beta1,
+            beta2=config.beta2,
+            weight_decay=config.weight_decay,
+        ),
+        1: sparse_sign_sgd(weight_decay=config.puzzle_emb_weight_decay),
+    }
+
+    optimizer = optax.multi_transform(transforms, build_param_labels)
     opt_state = optimizer.init(params)
-    return model, optimizer, opt_state
+    return params, static, optimizer, opt_state, param_labels
 
 
 def cosine_schedule_with_warmup_lr_lambda(
@@ -168,11 +186,14 @@ def init_train_state(
         * train_metadata.mean_puzzle_examples
         / config.global_batch_size
     )
-    model, optimizer, opt_state = create_model(config, train_metadata)
+    params, static, optimizer, opt_state, param_labels = create_model(
+        config, train_metadata
+    )
     rng = jax.random.PRNGKey(config.seed + 1)
     return (
         TrainState(
-            model=model,
+            params=params,
+            static=static,
             opt_state=opt_state,
             carry=None,
             step=0,
@@ -180,6 +201,7 @@ def init_train_state(
             rng=rng,
         ),
         optimizer,
+        param_labels,
     )
 
 
@@ -229,7 +251,7 @@ def train_loop(config: TrainConfig):
         global_batch_size=config.global_batch_size,
     )
 
-    train_state, optimizer = init_train_state(config, train_metadata)
+    train_state, optimizer, param_labels = init_train_state(config, train_metadata)
 
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
     wandb.init(
@@ -238,18 +260,22 @@ def train_loop(config: TrainConfig):
         config={**config.__dict__, "model": config.model},
         settings=wandb.Settings(_disable_stats=True),
     )
-    array_params, _ = eqx.partition(train_state.model, eqx.is_array)
-    wandb.log({"num_params": sum(x.size for x in jtu.tree_leaves(array_params))}, step=0)
+    wandb.log(
+        {"num_params": sum(x.size for x in jtu.tree_leaves(train_state.params))},
+        step=0,
+    )
 
     ema_helper = EMAHelper(mu=config.ema_rate)
-    ema_helper.register(train_state.model)
+    ema_helper.register(eqx.combine(train_state.params, train_state.static))
+    static_model = train_state.static
 
     @eqx.filter_jit
-    def train_step(model, opt_state, carry, batch, rng, lr_scale, global_batch_size):
-        gb = jnp.asarray(global_batch_size, dtype=jnp.float32)
+    def train_step(params, opt_state, carry, batch, rng, lr_main, lr_puzzle):
+        gb = jnp.asarray(batch["global_batch_size"], dtype=jnp.float32)
 
-        def loss_fn(model):
-            prepared_carry = prepare_carry(model, carry, batch)
+        def loss_fn(p):
+            model = eqx.combine(p, static_model)
+            prepared_carry = prepare_carry(model, carry, batch["data"])
             new_carry, loss, metrics, _, _ = act_loss(
                 model,
                 prepared_carry,
@@ -259,42 +285,56 @@ def train_loop(config: TrainConfig):
             )
             return loss / gb, (new_carry, metrics, loss)
 
-        (scaled_loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
+        (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
             loss_fn, has_aux=True
-        )(model)
-        updates, opt_state = optimizer.update(grads, opt_state, model)
-        updates = jax.tree_util.tree_map(lambda u: lr_scale * u, updates)
-        model = eqx.apply_updates(model, updates)
-        return model, opt_state, new_carry, unscaled_loss, metrics
+        )(params)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+
+        def scale_update(update, label):
+            if update is None:
+                return None
+            lr = jnp.where(jnp.equal(label, 1), lr_puzzle, lr_main)
+            return update * lr
+
+        updates = jax.tree.map(scale_update, updates, param_labels)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, new_carry, unscaled_loss, metrics
 
     for _, batch, global_batch_size in train_loader:
         if train_state.step >= train_state.total_steps:
             break
         batch_jnp = batch_to_jnp(batch)
         if train_state.carry is None:
-            train_state.carry = train_state.model.initial_carry(batch_jnp)
+            model = eqx.combine(train_state.params, train_state.static)
+            train_state.carry = model.initial_carry(batch_jnp)
 
-        lr_this_step = compute_lr(config.lr, config, train_state)
+        lr_main = compute_lr(config.lr, config, train_state)
+        lr_puzzle = compute_lr(config.puzzle_emb_lr, config, train_state)
         rng, step_rng = jax.random.split(train_state.rng)
+        batch_pack = {
+            "data": batch_jnp,
+            "global_batch_size": jnp.asarray(global_batch_size, dtype=jnp.float32),
+        }
         (
-            train_state.model,
+            new_params,
             train_state.opt_state,
             train_state.carry,
             loss,
             metrics,
         ) = train_step(
-            train_state.model,
+            train_state.params,
             train_state.opt_state,
             train_state.carry,
-            batch_jnp,
+            batch_pack,
             step_rng,
-            lr_this_step,
-            global_batch_size,
+            lr_main,
+            lr_puzzle,
         )
+        train_state.params = new_params
         train_state.step += 1
         train_state.rng = rng
 
-        ema_helper.update(train_state.model)
+        ema_helper.update(eqx.combine(train_state.params, train_state.static))
 
         metric_values = {k: float(v) for k, v in metrics.items()}
         if len(metric_values):
@@ -304,7 +344,8 @@ def train_loop(config: TrainConfig):
                 / (global_batch_size if k.endswith("loss") else count)
                 for k in metric_values
             }
-            logged["train/lr"] = lr_this_step
+            logged["train/lr"] = float(lr_main)
+            logged["train/puzzle_lr"] = float(lr_puzzle)
             wandb.log(logged, step=train_state.step)
             progress_bar.update(train_state.step - progress_bar.n)
 
