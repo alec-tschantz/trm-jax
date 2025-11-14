@@ -69,7 +69,7 @@ DEFAULT_CONFIG = TrainConfig(
         num_heads=8,
         expansion=4,
         puzzle_emb_ndim=512,
-        forward_dtype="float32",
+        forward_dtype="bfloat16",
         puzzle_emb_len=16,
     ),
 )

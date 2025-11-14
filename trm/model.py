@@ -26,17 +26,22 @@ class ModelConfig(BaseModel):
     puzzle_emb_ndim: int
     num_puzzle_identifiers: int
     vocab_size: int
+
     H_cycles: int
     L_cycles: int
     L_layers: int
+
     hidden_size: int
     expansion: float
     num_heads: int
+
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
+
     halt_max_steps: int
     halt_exploration_prob: float
-    forward_dtype: str = "float32"
+
+    forward_dtype: str = "bfloat16"
     puzzle_emb_len: int = 16
 
 
@@ -75,15 +80,15 @@ class Block(eqx.Module):
         self.norm_eps = config.rms_norm_eps
 
     def __call__(self, cos_sin: CosSin, h: jnp.ndarray) -> jnp.ndarray:
-        @jax.checkpoint
-        def _block(h):
-            dtype = h.dtype
-            attn_out = self.self_attn(cos_sin, h)
-            h2 = rms_norm(h + attn_out.astype(dtype), variance_epsilon=self.norm_eps)
-            mlp_out = self.mlp(h2)
-            return rms_norm(h2 + mlp_out.astype(dtype), variance_epsilon=self.norm_eps)
+        dtype = h.dtype
 
-        return _block(h)
+        attn_out = self.self_attn(cos_sin, h)
+        h2 = rms_norm(h + attn_out.astype(dtype), variance_epsilon=self.norm_eps)
+
+        mlp_out = self.mlp(h2)
+        h3 = rms_norm(h2 + mlp_out.astype(dtype), variance_epsilon=self.norm_eps)
+
+        return h3
 
 
 class ReasoningModule(eqx.Module):
@@ -115,8 +120,10 @@ class Inner(eqx.Module):
 
     def __init__(self, config: ModelConfig, *, key):
         self.config = config
+
         dtype = getattr(jnp, config.forward_dtype)
         self.forward_dtype = dtype
+
         self.embed_scale = math.sqrt(config.hidden_size)
         self.puzzle_emb_len = config.puzzle_emb_len
         embed_init_std = 1.0 / self.embed_scale
@@ -130,16 +137,31 @@ class Inner(eqx.Module):
             key=k1,
             cast_to=dtype,
         )
+
         self.lm_head = Linear(
             config.hidden_size,
             config.vocab_size,
             bias=False,
             key=k2,
         )
-        q_head = Linear(config.hidden_size, 1, bias=True, key=k3)
-        q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
+
+        q_head = Linear(
+            config.hidden_size,
+            1,
+            bias=True,
+            key=k3,
+        )
+        q_head = eqx.tree_at(
+            lambda m: m.weight,
+            q_head,
+            jnp.zeros_like(q_head.weight),
+        )
         bias_val = jnp.full_like(q_head.bias, -5.0)
-        q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
+        q_head = eqx.tree_at(
+            lambda m: m.bias,
+            q_head,
+            bias_val,
+        )
         self.q_head = q_head
 
         self.puzzle_emb = SparseEmbedding(
@@ -164,56 +186,70 @@ class Inner(eqx.Module):
         self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
         self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
 
-    def _input_embeddings(self, inputs, puzzle_ids):
+    def _input_embeddings(self, inputs: jnp.ndarray, puzzle_ids: jnp.ndarray):
         tok = self.embed_tokens(inputs.astype(jnp.int32))
-        puzz = self.puzzle_emb(puzzle_ids)
 
+        puzz = self.puzzle_emb(puzzle_ids)
         need = self.puzzle_emb_len * self.config.hidden_size - puzz.shape[-1]
         if need > 0:
-            puzz = jnp.pad(puzz, ((0, 0), (0, need)))
+            puzz = jnp.pad(puzz, ((0, 0), (0, need)))  # pad feature dim
 
         puzz = puzz.reshape(-1, self.puzzle_emb_len, self.config.hidden_size)
         emb = jnp.concatenate([puzz, tok], axis=1)
-        return (emb * self.embed_scale).astype(self.forward_dtype)
 
-    def empty_carry(self, bs):
+        emb = (emb * self.embed_scale).astype(self.forward_dtype)
+        return emb
+
+    def empty_carry(self, bs: int) -> InnerCarry:
         z = jnp.zeros(
             (bs, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size),
             dtype=self.forward_dtype,
         )
         return InnerCarry(z_H=z, z_L=z)
 
-    def reset_carry(self, reset, c):
+    def reset_carry(self, reset: jnp.ndarray, c: InnerCarry) -> InnerCarry:
         flag = reset.reshape((-1, 1, 1))
+
         h0 = self.H_init[None, None, :]
         l0 = self.L_init[None, None, :]
+
         zH = jnp.where(flag, h0, c.z_H)
         zL = jnp.where(flag, l0, c.z_L)
+
         return InnerCarry(z_H=zH, z_L=zL)
 
-    def _run_L(self, z_L, inj, cos_sin):
+    def _run_L(
+        self, z_L: jnp.ndarray, inj: jnp.ndarray, cos_sin: CosSin
+    ) -> jnp.ndarray:
         z_L = z_L.astype(self.forward_dtype)
         inj = inj.astype(self.forward_dtype)
 
-        def step(h, _):
-            out = self.L_level(h, inj, cos_sin).astype(self.forward_dtype)
-            return out, None
+        def body(h, _):
+            h_out = self.L_level(h, inj, cos_sin).astype(self.forward_dtype)
+            return h_out, None
 
-        z_L, _ = jax.lax.scan(step, z_L, xs=None, length=self.config.L_cycles)
+        body = eqx.filter_checkpoint(body)
+        z_L, _ = jax.lax.scan(body, z_L, xs=None, length=self.config.L_cycles)
         return z_L
 
-    def _run_H(self, z_H, z_L, inp, cos_sin):
+    def _run_H(
+        self,
+        z_H: jnp.ndarray,
+        z_L: jnp.ndarray,
+        inp: jnp.ndarray,
+        cos_sin: CosSin,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         z_H = z_H.astype(self.forward_dtype)
         z_L = z_L.astype(self.forward_dtype)
         inp = inp.astype(self.forward_dtype)
 
         def step(carry, _):
             zH, zL = carry
+
             inj = (zH + inp).astype(self.forward_dtype)
-
             zL_new = self._run_L(zL, inj, cos_sin)
-            zH_new = self.L_level(zH, zL_new, cos_sin).astype(self.forward_dtype)
 
+            zH_new = self.L_level(zH, zL_new, cos_sin).astype(self.forward_dtype)
             zH_new = jax.lax.stop_gradient(zH_new)
             zL_new = jax.lax.stop_gradient(zL_new)
 
@@ -221,19 +257,18 @@ class Inner(eqx.Module):
 
         if self.config.H_cycles > 1:
             (z_H, z_L), _ = jax.lax.scan(
-                step, (z_H, z_L), None, length=self.config.H_cycles - 1
+                step, (z_H, z_L), xs=None, length=self.config.H_cycles - 1
             )
 
         return z_H, z_L
 
-    def __call__(self, carry, batch):
+    def __call__(self, carry: InnerCarry, batch: Dict[str, jnp.ndarray]):
         cos_sin = self.rotary_emb()
         inp = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         z_H, z_L = carry.z_H, carry.z_L
 
         z_H, z_L = self._run_H(z_H, z_L, inp, cos_sin)
-
         inj = (z_H + inp).astype(self.forward_dtype)
         z_L = self._run_L(z_L, inj, cos_sin)
         z_H = self.L_level(z_H, z_L, cos_sin).astype(self.forward_dtype)
@@ -245,7 +280,6 @@ class Inner(eqx.Module):
 
         logits = self.lm_head(z_H).astype(jnp.float32)[:, self.puzzle_emb_len :, :]
         qh = self.q_head(z_H[:, 0]).astype(jnp.float32).squeeze(-1)
-
         return new_carry, logits, qh
 
 
@@ -253,12 +287,12 @@ class Model(eqx.Module):
     config: ModelConfig = eqx.field(static=True)
     inner: Inner
 
-    def __init__(self, cfg, *, key):
+    def __init__(self, cfg: dict, *, key):
         config = ModelConfig(**cfg)
         self.config = config
         self.inner = Inner(config, key=key)
 
-    def initial_carry(self, batch):
+    def initial_carry(self, batch: Dict[str, jnp.ndarray]) -> Carry:
         bs = batch["inputs"].shape[0]
         return Carry(
             inner_carry=self.inner.empty_carry(bs),
@@ -267,7 +301,7 @@ class Model(eqx.Module):
             current_data={k: jnp.zeros_like(v) for k, v in batch.items()},
         )
 
-    def __call__(self, carry, rng, training: bool):
+    def __call__(self, carry: Carry, rng, training: bool):
         new_inner, logits, qh = self.inner(carry.inner_carry, carry.current_data)
 
         new_steps = carry.steps + 1
@@ -276,13 +310,20 @@ class Model(eqx.Module):
 
         if training and self.config.halt_max_steps > 1:
             halted = jnp.logical_or(halted, qh > 0)
+
             rng_h, rng_m = jax.random.split(rng)
             r = jax.random.uniform(rng_h, qh.shape)
             sample = r < self.config.halt_exploration_prob
+
             sampled_min = jax.random.randint(
-                rng_m, new_steps.shape, 2, self.config.halt_max_steps + 1, jnp.int32
+                rng_m,
+                new_steps.shape,
+                minval=2,
+                maxval=self.config.halt_max_steps + 1,
+                dtype=jnp.int32,
             )
             min_steps = jnp.where(sample, sampled_min, jnp.zeros_like(sampled_min))
+
             halted = jnp.logical_and(halted, new_steps >= min_steps)
 
         return (
