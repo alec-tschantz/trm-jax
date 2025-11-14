@@ -7,17 +7,17 @@ import jax
 import jax.numpy as jnp
 from pydantic import BaseModel
 
-from trm.layers import (
+from trm.utils import trunc_normal
+from trm.nn import (
     Attention,
-    CastedEmbedding,
-    CastedLinear,
+    Embedding,
+    Linear,
     CosSin,
     RotaryEmbedding,
     SwiGLU,
     rms_norm,
 )
-from trm.sparse_embedding import CastedSparseEmbedding
-from trm.utils import trunc_normal
+from trm.embedding import SparseEmbedding
 
 
 class ModelConfig(BaseModel):
@@ -105,10 +105,10 @@ class Inner(eqx.Module):
     embed_scale: float = eqx.field(static=True)
     puzzle_emb_len: int = eqx.field(static=True)
 
-    embed_tokens: CastedEmbedding
-    lm_head: CastedLinear
-    q_head: CastedLinear
-    puzzle_emb: CastedSparseEmbedding
+    embed_tokens: Embedding
+    lm_head: Linear
+    q_head: Linear
+    puzzle_emb: SparseEmbedding
     rotary_emb: RotaryEmbedding
     L_level: ReasoningModule
     H_init: jnp.ndarray
@@ -124,26 +124,26 @@ class Inner(eqx.Module):
 
         k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
 
-        self.embed_tokens = CastedEmbedding(
+        self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
             init_std=embed_init_std,
             key=k1,
             cast_to=dtype,
         )
-        self.lm_head = CastedLinear(
+        self.lm_head = Linear(
             config.hidden_size,
             config.vocab_size,
             bias=False,
             key=k2,
         )
-        q_head = CastedLinear(config.hidden_size, 1, bias=True, key=k3)
+        q_head = Linear(config.hidden_size, 1, bias=True, key=k3)
         q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
         bias_val = jnp.full_like(q_head.bias, -5.0)
         q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
         self.q_head = q_head
 
-        self.puzzle_emb = CastedSparseEmbedding(
+        self.puzzle_emb = SparseEmbedding(
             config.num_puzzle_identifiers,
             config.puzzle_emb_ndim,
             init_std=0.0,

@@ -35,7 +35,7 @@ def apply_rotary_pos_emb(
     return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
 
 
-class CastedLinear(eqx.Module):
+class Linear(eqx.Module):
     weight: jnp.ndarray
     bias: jnp.ndarray | None
     use_bias: bool = eqx.field(static=True)
@@ -61,7 +61,7 @@ class CastedLinear(eqx.Module):
         return out.astype(out_dtype)
 
 
-class CastedEmbedding(eqx.Module):
+class Embedding(eqx.Module):
     weight: jnp.ndarray
     cast_to: jnp.dtype = eqx.field(static=True)
 
@@ -111,8 +111,8 @@ class Attention(eqx.Module):
     num_key_value_heads: int = eqx.field(static=True)
     causal: bool = eqx.field(static=True)
 
-    qkv_proj: CastedLinear
-    o_proj: CastedLinear
+    qkv_proj: Linear
+    o_proj: Linear
 
     def __init__(
         self,
@@ -132,13 +132,13 @@ class Attention(eqx.Module):
         self.causal = causal
 
         k_qkv, k_o = jax.random.split(key)
-        self.qkv_proj = CastedLinear(
+        self.qkv_proj = Linear(
             hidden_size,
             (num_heads + 2 * num_key_value_heads) * head_dim,
             bias=False,
             key=k_qkv,
         )
-        self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False, key=k_o)
+        self.o_proj = Linear(self.output_size, hidden_size, bias=False, key=k_o)
 
     def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray) -> jnp.ndarray:
         out_dtype = hidden_states.dtype
@@ -183,8 +183,8 @@ class Attention(eqx.Module):
 
 
 class SwiGLU(eqx.Module):
-    gate_up_proj: CastedLinear
-    down_proj: CastedLinear
+    gate_up_proj: Linear
+    down_proj: Linear
     hidden_size: int = eqx.field(static=True)
     expansion: float = eqx.field(static=True)
 
@@ -193,10 +193,10 @@ class SwiGLU(eqx.Module):
         self.expansion = expansion
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
         gate_key, down_key = jax.random.split(key)
-        self.gate_up_proj = CastedLinear(
+        self.gate_up_proj = Linear(
             hidden_size, inter * 2, bias=False, key=gate_key
         )
-        self.down_proj = CastedLinear(inter, hidden_size, bias=False, key=down_key)
+        self.down_proj = Linear(inter, hidden_size, bias=False, key=down_key)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)

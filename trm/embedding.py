@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from trm.utils import trunc_normal
 
 
-class CastedSparseEmbedding(eqx.Module):
+class SparseEmbedding(eqx.Module):
     weight: jnp.ndarray
     cast_to: jnp.dtype = eqx.field(static=True)
 
