@@ -12,7 +12,6 @@ from pydantic import BaseModel
 
 
 IGNORE_LABEL_ID = -100
-DIHEDRAL_INVERSE = [0, 3, 2, 1, 4, 5, 6, 7]
 
 
 class PuzzleDatasetMetadata(pydantic.BaseModel):
@@ -145,7 +144,6 @@ class PuzzleDataset(IterableDataset):
                 batch["labels"] == self.metadata.ignore_label_id
             ] = IGNORE_LABEL_ID
 
-        # Pad
         if batch["puzzle_identifiers"].size < self.local_batch_size:
             pad_size = self.local_batch_size - batch["puzzle_identifiers"].size
             pad_values = {
@@ -236,9 +234,7 @@ class PuzzleDataset(IterableDataset):
                     global_batch_size=self.config.global_batch_size,
                 )
 
-                global_effective_batch_size = (
-                    batch_puzzle_indices.size
-                )  # Global effective batch size, excluding pads
+                global_effective_batch_size = batch_puzzle_indices.size
 
                 if global_effective_batch_size < self.config.global_batch_size:
                     break
@@ -292,18 +288,15 @@ def _sample_batch(
     current_size = 0
 
     while (start_index < group_order.size) and (current_size < global_batch_size):
-        # Pick a group and a puzzle from that group
         group_id = group_order[start_index]
         puzzle_id = rng.integers(group_indices[group_id], group_indices[group_id + 1])
         start_index += 1
 
-        # Get range of the puzzle
         puzzle_start = puzzle_indices[puzzle_id]
         puzzle_size = int(puzzle_indices[puzzle_id + 1] - puzzle_start)
 
         append_size = min(puzzle_size, global_batch_size - current_size)
 
-        # Put into batch
         batch_puzzle_indices.append(np.full(append_size, puzzle_id, dtype=np.int32))
         batch.append(
             puzzle_start + np.random.choice(puzzle_size, append_size, replace=False)
@@ -312,30 +305,3 @@ def _sample_batch(
         current_size += append_size
 
     return start_index, np.concatenate(batch), np.concatenate(batch_puzzle_indices)
-
-
-def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
-    """8 dihedral symmetries by rotate, flip and mirror"""
-
-    if tid == 0:
-        return arr
-    elif tid == 1:
-        return np.rot90(arr, k=1)
-    elif tid == 2:
-        return np.rot90(arr, k=2)
-    elif tid == 3:
-        return np.rot90(arr, k=3)
-    elif tid == 4:
-        return np.fliplr(arr)
-    elif tid == 5:
-        return np.flipud(arr)
-    elif tid == 6:
-        return arr.T
-    elif tid == 7:
-        return np.fliplr(np.rot90(arr, k=1))
-    else:
-        return arr
-
-
-def inverse_dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
-    return dihedral_transform(arr, DIHEDRAL_INVERSE[tid])
