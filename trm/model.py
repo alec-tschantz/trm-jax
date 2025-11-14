@@ -28,7 +28,6 @@ class ModelConfig(BaseModel):
     vocab_size: int
     H_cycles: int
     L_cycles: int
-    H_layers: int
     L_layers: int
     hidden_size: int
     expansion: float

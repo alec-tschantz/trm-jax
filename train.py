@@ -64,7 +64,6 @@ DEFAULT_CONFIG = TrainConfig(
         halt_max_steps=16,
         H_cycles=3,
         L_cycles=4,
-        H_layers=0,
         L_layers=2,
         hidden_size=512,
         num_heads=8,
