@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from torch.nn.functional import scaled_dot_product_attention
 
-from torch_models.utils import trunc_normal_init_
+from trm.utils import trunc_normal_init_
 
 
 CosSin = Tuple[torch.Tensor, torch.Tensor]
@@ -17,7 +17,6 @@ def _find_multiple(a, b):
 
 
 def rotate_half(x: torch.Tensor):
-    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -26,8 +25,6 @@ def rotate_half(x: torch.Tensor):
 def apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ):
-    # q, k: [bs, seq_len, num_heads, head_dim]
-    # cos, sin: [seq_len, head_dim]
     orig_dtype = q.dtype
     q = q.to(cos.dtype)
     k = k.to(cos.dtype)
@@ -41,7 +38,6 @@ def apply_rotary_pos_emb(
 class CastedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool):
         super().__init__()
-        # Truncated LeCun normal init
         self.weight = nn.Parameter(
             trunc_normal_init_(
                 torch.empty((out_features, in_features)), std=1.0 / (in_features**0.5)
@@ -49,7 +45,6 @@ class CastedLinear(nn.Module):
         )
         self.bias = None
         if bias:
-            # Zero init bias
             self.bias = nn.Parameter(torch.zeros((out_features,)))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -71,7 +66,6 @@ class CastedEmbedding(nn.Module):
         super().__init__()
         self.cast_to = cast_to
 
-        # Truncated LeCun normal init
         self.embedding_weight = nn.Parameter(
             trunc_normal_init_(
                 torch.empty((num_embeddings, embedding_dim)), std=init_std
@@ -86,14 +80,12 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings, base, device=None):
         super().__init__()
 
-        # RoPE
         inv_freq = 1.0 / (
             base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
         )
         t = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
 
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer('cos_cached', emb.cos(), persistent=False)
         self.register_buffer('sin_cached', emb.sin(), persistent=False)
@@ -125,10 +117,8 @@ class Attention(nn.Module):
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # hidden_states: [bs, seq_len, num_heads, head_dim]
         qkv = self.qkv_proj(hidden_states)
 
-        # Split head
         qkv = qkv.view(
             batch_size,
             seq_len,
@@ -139,12 +129,10 @@ class Attention(nn.Module):
         key = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
         value = qkv[:, :, self.num_heads + self.num_key_value_heads :]
 
-        # RoPE
         if cos_sin is not None:
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
         query, key, value = map(
             lambda t: einops.rearrange(t, "B S H D -> B H S D"), (query, key, value)
         )
@@ -157,17 +145,12 @@ class Attention(nn.Module):
 
 
 class LinearSwish(nn.Module):
-    def __init__(self, hidden_size: int, reverse=False):
+    def __init__(self, hidden_size: int):
         super().__init__()
-
         self.linear = CastedLinear(hidden_size, hidden_size, bias=False)
-        self.reverse = reverse
 
     def forward(self, x):
-        if self.reverse:
-            return F.silu(self.linear(x))
-        else:
-            return self.linear(F.silu(x))
+        return self.linear(F.silu(x))
 
 
 class SwiGLU(nn.Module):

@@ -5,7 +5,7 @@ from torch import nn
 import torch.distributed as dist
 from torch.optim.optimizer import Optimizer, ParamsT
 
-from torch_models.utils import trunc_normal_init_
+from trm.utils import trunc_normal_init_
 
 
 class CastedSparseEmbedding(nn.Module):

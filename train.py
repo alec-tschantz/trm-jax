@@ -21,21 +21,16 @@ from omegaconf import DictConfig
 from adam_atan2_pytorch import AdamAtan2
 
 from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
-from torch_models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
-from torch_models.ema import EMAHelper
+from trm.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from trm.ema import EMAHelper
+from trm.losses import ACTLossHead
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-class LossConfig(pydantic.BaseModel):
-    model_config = pydantic.ConfigDict(extra="allow")
-    name: str
 
 
 class ArchConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="allow")
     name: str
-    loss: LossConfig
 
 
 class EvaluatorConfig(pydantic.BaseModel):
@@ -144,31 +139,20 @@ def create_model(
     )
 
     model_cls = load_model_class(config.arch.name)
-    loss_head_cls = load_model_class(config.arch.loss.name)
 
     with torch.device(DEVICE):
         model: nn.Module = model_cls(model_cfg)
         print(model)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        model = ACTLossHead(model)
         model = model.to(DEVICE)
         if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model)  # type: ignore
+            model = torch.compile(model)
         load_checkpoint(model, config)
 
-    if config.arch.puzzle_emb_ndim == 0:
-        optimizers = [
-            AdamAtan2(
-                model.parameters(),
-                lr=0,
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2),
-            )
-        ]
-        optimizer_lrs = [config.lr]
-    elif config.freeze_weights:
+    if config.freeze_weights:
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
-                model.model.puzzle_emb.buffers(),  # type: ignore
+                model.model.puzzle_emb.buffers(),
                 lr=1e-4,
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=1,
@@ -178,7 +162,7 @@ def create_model(
     else:
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
-                model.model.puzzle_emb.buffers(),  # type: ignore
+                model.model.puzzle_emb.buffers(),
                 lr=0,
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=1,
@@ -194,19 +178,6 @@ def create_model(
 
     return model, optimizers, optimizer_lrs
 
-
-def mix_weights_direct(device, alpha, net, nets):
-    sd = []
-    for i in range(len(nets)):
-        sd += [nets[i].state_dict()]
-    sd_alpha = {}
-    for k in sd[0].keys():
-        comb_net = alpha[0] * sd[0][k].to(device)
-        for i in range(1, lechen(nets)):
-            comb_net += alpha[i] * sd[i][k].to(device)
-        sd_alpha[k] = comb_net
-    net.load_state_dict(sd_alpha)
-    return net
 
 
 def cosine_schedule_with_warmup_lr_lambda(
@@ -274,7 +245,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         print(f"Loading checkpoint {config.load_checkpoint}")
         state_dict = torch.load(config.load_checkpoint, map_location=DEVICE)
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
-        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
+        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape
         if puzzle_emb_name in state_dict:
             puzzle_emb = state_dict[puzzle_emb_name]
             if puzzle_emb.shape != expected_shape:
@@ -308,12 +279,13 @@ def create_evaluators(
     evaluators = []
     for cfg in config.evaluators:
         for data_path in data_paths:
-            cls = load_model_class(cfg.name, "evaluators.")(
+            evaluator_cls = load_model_class(cfg.name, "evaluators.")
+            evaluator = evaluator_cls(
                 data_path=data_path,
                 eval_metadata=eval_metadata,
                 **cfg.__pydantic_extra__,
-            )  # type: ignore
-            evaluators.append(cls)
+            )
+            evaluators.append(evaluator)
 
     return evaluators
 
@@ -332,7 +304,7 @@ def train_batch(
 
     if train_state.carry is None:
         with torch.device(DEVICE):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+            train_state.carry = train_state.model.initial_carry(batch)
 
     train_state.carry, loss, metrics, _, _ = train_state.model(
         carry=train_state.carry, batch=batch, return_keys=[]
@@ -394,7 +366,7 @@ def evaluate(
 
             batch = {k: v.to(DEVICE) for k, v in batch.items()}
             with torch.device(DEVICE):
-                carry = train_state.model.initial_carry(batch)  # type: ignore
+                carry = train_state.model.initial_carry(batch)
 
             inference_steps = 0
             while True:
@@ -494,7 +466,6 @@ def save_code_and_config(config: PretrainConfig):
 
     code_list = [
         get_model_source_path(config.arch.name),
-        get_model_source_path(config.arch.loss.name),
     ]
     for code_file in code_list:
         if code_file is not None:
@@ -511,7 +482,7 @@ def save_code_and_config(config: PretrainConfig):
 def load_synced_config(
     hydra_config: DictConfig,
 ) -> PretrainConfig:
-    config = PretrainConfig(**hydra_config)  # type: ignore
+    config = PretrainConfig(**hydra_config)
 
     if config.project_name is None:
         config.project_name = (
@@ -574,7 +545,12 @@ def launch(hydra_config: DictConfig):
     progress_bar = None
     ema_helper = None
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
-    wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+    wandb.init(
+        project=config.project_name,
+        name=config.run_name,
+        config=config.model_dump(),
+        settings=wandb.Settings(_disable_stats=True),
+    )
     wandb.log(
         {"num_params": sum(x.numel() for x in train_state.model.parameters())},
         step=0,
@@ -600,7 +576,7 @@ def launch(hydra_config: DictConfig):
 
             if metrics is not None:
                 wandb.log(metrics, step=train_state.step)
-                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                progress_bar.update(train_state.step - progress_bar.n)
             if config.ema:
                 ema_helper.update(train_state.model)
 

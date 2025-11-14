@@ -1,52 +1,26 @@
 hydra:
   output_subdir: null
 
-# ---------------------------
-# Architecture config
-# ---------------------------
 arch:
-  name: trm@TinyRecursiveReasoningModel_ACTV1
-
-  loss:
-    name: losses@ACTLossHead
-    loss_type: stablemax_cross_entropy
-
+  name: trm@TinyRecursiveReasoningModel
   halt_exploration_prob: 0.1
   halt_max_steps: 16
-
   H_cycles: 3
   L_cycles: 4
-
   H_layers: 0
   L_layers: 2
-
   hidden_size: 512
-  num_heads: 8 
+  num_heads: 8
   expansion: 4
-
   puzzle_emb_ndim: ${arch.hidden_size}
-
-  pos_encodings: rope
   forward_dtype: bfloat16
-
-  mlp_t: false
   puzzle_emb_len: 16
-  no_ACT_continue: true
 
-# ---------------------------
-# Data
-# ---------------------------
 data_paths: ["data/maze-30x30-hard-1k"]
 data_paths_test: []
 
-# ---------------------------
-# Evaluators
-# ---------------------------
 evaluators: []
 
-# ---------------------------
-# Training hyperparameters
-# ---------------------------
 global_batch_size: 192
 
 epochs: 50000
@@ -64,14 +38,11 @@ puzzle_emb_weight_decay: 1.0
 
 puzzle_emb_lr: 1e-4
 
-# ---------------------------
-# Misc
-# ---------------------------
 seed: 0
 min_eval_interval: 0
 
 ema: true
-ema_rate: 0.999 # EMA-rate
+ema_rate: 0.999
 freeze_weights: false
 
 project_name: null

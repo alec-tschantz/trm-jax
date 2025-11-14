@@ -3,7 +3,6 @@ from typing import Any, Tuple, Dict, Sequence, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-import math
 
 IGNORE_LABEL_ID = -100
 
@@ -30,23 +29,14 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask
     return -torch.where(valid_mask, prediction_logprobs, 0)
 
 
-def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
-    return F.cross_entropy(
-        logits.to(torch.float32).view(-1, logits.shape[-1]),
-        labels.to(torch.long).view(-1),
-        ignore_index=ignore_index,
-        reduction="none",
-    ).view(labels.shape)
-
-
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
-        self.loss_fn = globals()[loss_type]
+        self.loss_fn = stablemax_cross_entropy
 
     def initial_carry(self, *args, **kwargs):
-        return self.model.initial_carry(*args, **kwargs)  # type: ignore
+        return self.model.initial_carry(*args, **kwargs)
 
     def forward(
         self,
@@ -104,20 +94,11 @@ class ACTLossHead(nn.Module):
                 "q_halt_loss": q_halt_loss.detach(),
             }
         )
-        q_continue_loss = 0
-        if "target_q_continue" in outputs:
-            q_continue_loss = F.binary_cross_entropy_with_logits(
-                outputs["q_continue_logits"],
-                outputs["target_q_continue"],
-                reduction="sum",
-            )
-
-            metrics["q_continue_loss"] = q_continue_loss.detach()
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
         return (
             new_carry,
-            lm_loss + 0.5 * (q_halt_loss + q_continue_loss),
+            lm_loss + 0.5 * q_halt_loss,
             metrics,
             detached_outputs,
             new_carry.halted.all(),
