@@ -14,10 +14,10 @@ from trm.nn import (
     Linear,
     CosSin,
     RotaryEmbedding,
+    SparseEmbedding,
     SwiGLU,
     rms_norm,
 )
-from trm.embedding import SparseEmbedding
 
 
 class ModelConfig(BaseModel):
