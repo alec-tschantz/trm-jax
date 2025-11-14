@@ -1,5 +1,6 @@
 from typing import Dict, Sequence, Tuple
 
+import jax.nn as jnn
 import jax.numpy as jnp
 import optax
 
@@ -8,22 +9,13 @@ from trm.model import Carry, Model
 IGNORE_LABEL_ID = -100
 
 
-def s(x: jnp.ndarray, epsilon: float = 1e-30) -> jnp.ndarray:
-    return jnp.where(x < 0, 1 / (1 - x + epsilon), x + 1)
-
-
-def log_stablemax(x: jnp.ndarray, axis: int = -1) -> jnp.ndarray:
-    s_x = s(x)
-    return jnp.log(s_x) - jnp.log(jnp.sum(s_x, axis=axis, keepdims=True))
-
-
 def stablemax_cross_entropy(
     logits: jnp.ndarray,
     labels: jnp.ndarray,
     ignore_index: int = IGNORE_LABEL_ID,
     valid_mask: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    logprobs = log_stablemax(logits.astype(jnp.float64), axis=-1)
+    logprobs = jnn.log_softmax(logits.astype(jnp.float64), axis=-1)
     if valid_mask is None:
         valid_mask = labels != ignore_index
     transformed_labels = jnp.where(valid_mask, labels, 0)

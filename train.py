@@ -15,7 +15,7 @@ import wandb
 from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from trm.losses import act_loss
 from trm.model import Carry, Model
-from trm.ema import EMAHelper
+from trm.utils import EMAHelper
 from trm.optim import adam_atan2, sparse_sign_sgd
 
 jax.config.update("jax_enable_x64", True)
@@ -34,6 +34,7 @@ class TrainConfig:
     beta2: float
     puzzle_emb_lr: float
     puzzle_emb_weight_decay: float
+    grad_clip_norm: float | None
     project_name: str
     run_name: str
     seed: int
@@ -53,6 +54,7 @@ DEFAULT_CONFIG = TrainConfig(
     beta2=0.95,
     puzzle_emb_lr=1e-4,
     puzzle_emb_weight_decay=1.0,
+    grad_clip_norm=1.0,
     project_name="maze-act",
     run_name="default",
     seed=0,
@@ -260,6 +262,13 @@ def train_loop(config: TrainConfig):
     ema_helper = EMAHelper(mu=config.ema_rate)
     ema_helper.register(eqx.combine(train_state.params, train_state.static))
     static_model = train_state.static
+    max_grad_norm = config.grad_clip_norm
+    clipper = (
+        optax.clip_by_global_norm(max_grad_norm)
+        if max_grad_norm is not None
+        else None
+    )
+    clipper_state = optax.EmptyState() if clipper is not None else None
 
     @eqx.filter_jit
     def train_step(params, opt_state, carry, batch, rng, lr_main, lr_puzzle):
@@ -280,6 +289,10 @@ def train_loop(config: TrainConfig):
         (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
             loss_fn, has_aux=True
         )(params)
+
+        if clipper is not None:
+            grads, _ = clipper.update(grads, clipper_state)
+
         updates, opt_state = optimizer.update(grads, opt_state, params)
 
         def scale_update(update, label):
