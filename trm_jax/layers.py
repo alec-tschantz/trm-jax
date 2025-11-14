@@ -27,11 +27,14 @@ def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
 def apply_rotary_pos_emb(
     q: jnp.ndarray, k: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    orig_dtype = q.dtype
     cos = cos[None, :, None, :]
     sin = sin[None, :, None, :]
+    q = q.astype(cos.dtype)
+    k = k.astype(cos.dtype)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
 
 
 class CastedLinear(eqx.Module):
@@ -51,12 +54,13 @@ class CastedLinear(eqx.Module):
             self.bias = None
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        dtype = x.dtype
-        weight = jnp.transpose(self.weight.astype(dtype), (1, 0))
-        out = jnp.matmul(x, weight)
+        out_dtype = x.dtype
+        x32 = x.astype(jnp.float32)
+        weight_t = jnp.transpose(self.weight, (1, 0))
+        out = jnp.matmul(x32, weight_t)
         if self.bias is not None:
-            out = out + self.bias.astype(dtype)
-        return out
+            out = out + self.bias
+        return out.astype(out_dtype)
 
 
 class CastedEmbedding(eqx.Module):
@@ -140,6 +144,7 @@ class Attention(eqx.Module):
         self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False, key=o_key)
 
     def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray) -> jnp.ndarray:
+        orig_dtype = hidden_states.dtype
         batch_size, seq_len, _ = hidden_states.shape
         qkv = self.qkv_proj(hidden_states)
         qkv = qkv.reshape(
@@ -160,14 +165,19 @@ class Attention(eqx.Module):
             sin = sin[:seq_len]
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
+        query_f = query.astype(jnp.float32)
+        key_f = key.astype(jnp.float32)
+        value_f = value.astype(jnp.float32)
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn_scores = jnp.einsum("bthd, bshd -> bhts", query, key) * scale
+        attn_scores = jnp.einsum("bthd, bshd -> bhts", query_f, key_f) * scale
         if self.causal:
             mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-            attn_scores = jnp.where(mask[None, None, :, :], attn_scores, -1e9)
+            neg_inf = jnp.full_like(attn_scores, -1e9)
+            attn_scores = jnp.where(mask[None, None, :, :], attn_scores, neg_inf)
         attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-        attn_output = jnp.einsum("bhts, bshd -> bthd", attn_weights, value)
+        attn_output = jnp.einsum("bhts, bshd -> bthd", attn_weights, value_f)
         attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)
+        attn_output = attn_output.astype(orig_dtype)
         return self.o_proj(attn_output)
 
 

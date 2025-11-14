@@ -327,7 +327,7 @@ class Model(eqx.Module):
             sampled_min = jax.random.randint(
                 rng_m, new_steps.shape, 2, self.config.halt_max_steps + 1, jnp.int32
             )
-            min_steps = jnp.where(sample, sampled_min, self.config.halt_max_steps)
+            min_steps = jnp.where(sample, sampled_min, jnp.zeros_like(sampled_min))
             halted = jnp.logical_and(halted, new_steps >= min_steps)
 
         return (
