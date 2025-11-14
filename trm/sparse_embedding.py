@@ -1,135 +1,30 @@
-from typing import Union
+import equinox as eqx
+import jax.numpy as jnp
 
-import torch
-from torch import nn
-import torch.distributed as dist
-from torch.optim.optimizer import Optimizer, ParamsT
-
-from trm.utils import trunc_normal_init_
+from trm.utils import trunc_normal
 
 
-class CastedSparseEmbedding(nn.Module):
+class CastedSparseEmbedding(eqx.Module):
+    weight: jnp.ndarray
+    cast_to: jnp.dtype = eqx.field(static=True)
+
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
-        batch_size: int,
+        *,
         init_std: float,
-        cast_to: torch.dtype,
+        key,
+        cast_to=jnp.float32,
     ):
-        super().__init__()
+        if init_std == 0.0:
+            weight = jnp.zeros((num_embeddings, embedding_dim), dtype=jnp.float32)
+        else:
+            weight = trunc_normal(key, (num_embeddings, embedding_dim), std=init_std)
+        self.weight = weight.astype(jnp.float32)
         self.cast_to = cast_to
 
-        weights_tensor = trunc_normal_init_(
-            torch.empty((num_embeddings, embedding_dim)), std=init_std
-        )
-        self.register_buffer("weights", weights_tensor)
-
-        # Local weights and IDs
-        local_weights_tensor = torch.zeros(
-            batch_size, embedding_dim, requires_grad=True
-        )
-        self.register_buffer("local_weights", local_weights_tensor, persistent=False)
-
-        local_ids_tensor = torch.zeros(batch_size, dtype=torch.int32)
-        self.register_buffer("local_ids", local_ids_tensor, persistent=False)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if not self.training:
-            return self.weights[inputs].to(self.cast_to)
-
-        with torch.no_grad():
-            self.local_weights.copy_(self.weights[inputs])
-            self.local_ids.copy_(inputs)
-
-        return self.local_weights.to(self.cast_to)
-
-
-class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
-    def __init__(
-        self,
-        params: ParamsT,
-        world_size: int,
-        lr: Union[float, torch.Tensor] = 1e-3,
-        weight_decay: float = 1e-2,
-    ):
-        if not 0.0 <= lr:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= weight_decay:
-            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-
-        defaults = dict(lr=lr, weight_decay=weight_decay, world_size=world_size)
-        super().__init__(params, defaults)
-
-    @torch.no_grad
-    def step(self, closure=None):
-        for group in self.param_groups:
-            local_weights_grad = None
-            local_ids = None
-            weights = None
-
-            assert len(group["params"]) == 3
-            for p in group["params"]:
-                if p.requires_grad:
-                    local_weights_grad = p.grad
-                elif p.ndim == 1:
-                    local_ids = p
-                elif p.ndim == 2:
-                    weights = p
-                else:
-                    assert False
-
-            assert local_ids is not None
-            assert weights is not None
-
-            if local_weights_grad is not None:
-                _sparse_emb_signsgd_dist(
-                    local_weights_grad,
-                    local_ids,
-                    weights,
-                    lr=group["lr"],
-                    weight_decay=group["weight_decay"],
-                    world_size=group["world_size"],
-                )
-
-
-def _sparse_emb_signsgd_dist(
-    local_weights_grad: torch.Tensor,
-    local_ids: torch.Tensor,
-    weights: torch.Tensor,
-    lr: float,
-    weight_decay: float,
-    world_size: int,
-) -> None:
-    N, D = local_weights_grad.shape
-
-    all_weights_grad = local_weights_grad
-    all_ids = local_ids
-
-    if world_size > 1:
-        all_weights_grad = torch.empty(
-            (world_size * N, D),
-            dtype=local_weights_grad.dtype,
-            device=local_weights_grad.device,
-        )
-        all_ids = torch.empty(
-            world_size * N, dtype=local_ids.dtype, device=local_ids.device
-        )
-
-        dist.all_gather_into_tensor(all_weights_grad, local_weights_grad)
-        dist.all_gather_into_tensor(all_ids, local_ids)
-
-    grad_ids, inv = all_ids.unique(return_inverse=True)
-
-    grad = torch.zeros(
-        (grad_ids.shape[0], D),
-        dtype=all_weights_grad.dtype,
-        device=all_weights_grad.device,
-    )
-    grad.scatter_add_(0, inv.unsqueeze(-1).expand(-1, D), all_weights_grad)
-
-    p = weights[grad_ids]
-
-    p.mul_(1.0 - lr * weight_decay).add_(torch.sign(grad), alpha=-lr)
-
-    weights[grad_ids] = p
+    def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        idx = inputs.astype(jnp.int32)
+        embedded = self.weight[idx]
+        return embedded.astype(self.cast_to)

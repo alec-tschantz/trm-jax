@@ -1,175 +1,211 @@
+import math
 from typing import Tuple
-import einops
-import torch
-from torch import nn
-import torch.nn.functional as F
 
-from torch.nn.functional import scaled_dot_product_attention
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 
-from trm.utils import trunc_normal_init_
+from trm.utils import trunc_normal
 
 
-CosSin = Tuple[torch.Tensor, torch.Tensor]
+CosSin = Tuple[jnp.ndarray, jnp.ndarray]
 
 
-def _find_multiple(a, b):
+def _find_multiple(a: int, b: int) -> int:
     return (-(a // -b)) * b
 
 
-def rotate_half(x: torch.Tensor):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return jnp.concatenate((-x2, x1), axis=-1)
 
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-):
+    q: jnp.ndarray, k: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     orig_dtype = q.dtype
-    q = q.to(cos.dtype)
-    k = k.to(cos.dtype)
+    cos = cos[None, :, None, :]
+    sin = sin[None, :, None, :]
+    q = q.astype(cos.dtype)
+    k = k.astype(cos.dtype)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
 
-    q_embed = (q * cos.unsqueeze(-2)) + (rotate_half(q) * sin.unsqueeze(-2))
-    k_embed = (k * cos.unsqueeze(-2)) + (rotate_half(k) * sin.unsqueeze(-2))
 
-    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+class CastedLinear(eqx.Module):
+    weight: jnp.ndarray
+    bias: jnp.ndarray | None
+    use_bias: bool = eqx.field(static=True)
 
-
-class CastedLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool):
-        super().__init__()
-        self.weight = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty((out_features, in_features)), std=1.0 / (in_features**0.5)
-            )
+    def __init__(self, in_features: int, out_features: int, *, bias: bool, key):
+        std = 1.0 / math.sqrt(in_features)
+        self.weight = trunc_normal(key, (out_features, in_features), std=std).astype(
+            jnp.float32
         )
-        self.bias = None
+        self.use_bias = bias
         if bias:
-            self.bias = nn.Parameter(torch.zeros((out_features,)))
+            self.bias = jnp.zeros((out_features,), dtype=jnp.float32)
+        else:
+            self.bias = None
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(
-            input,
-            self.weight.to(input.dtype),
-            bias=self.bias.to(input.dtype) if self.bias is not None else None,
-        )
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        out_dtype = x.dtype
+        x32 = x.astype(jnp.float32)
+        weight_t = jnp.transpose(self.weight, (1, 0))
+        out = jnp.matmul(x32, weight_t)
+        if self.bias is not None:
+            out = out + self.bias
+        return out.astype(out_dtype)
 
 
-class CastedEmbedding(nn.Module):
+class CastedEmbedding(eqx.Module):
+    weight: jnp.ndarray
+    cast_to: jnp.dtype = eqx.field(static=True)
+
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
+        *,
         init_std: float,
-        cast_to: torch.dtype,
+        key,
+        cast_to=jnp.float32,
     ):
-        super().__init__()
+        if init_std == 0.0:
+            weight = jnp.zeros((num_embeddings, embedding_dim), dtype=jnp.float32)
+        else:
+            weight = trunc_normal(key, (num_embeddings, embedding_dim), std=init_std)
+        self.weight = weight.astype(jnp.float32)
         self.cast_to = cast_to
 
-        self.embedding_weight = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty((num_embeddings, embedding_dim)), std=init_std
-            )
-        )
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input, self.embedding_weight.to(self.cast_to))
+    def __call__(self, input: jnp.ndarray) -> jnp.ndarray:
+        idx = input.astype(jnp.int32)
+        embeds = self.weight[idx]
+        return embeds.astype(self.cast_to)
 
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings, base, device=None):
-        super().__init__()
+class RotaryEmbedding(eqx.Module):
+    cos_cached: jnp.ndarray
+    sin_cached: jnp.ndarray
 
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-        )
-        t = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
+    def __init__(self, dim: int, max_position_embeddings: int, base: float):
+        inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+        t = jnp.arange(max_position_embeddings, dtype=jnp.float32)
+        freqs = jnp.einsum("i,j->ij", t, inv_freq)
+        emb = jnp.concatenate([freqs, freqs], axis=-1)
+        self.cos_cached = jnp.cos(emb)
+        self.sin_cached = jnp.sin(emb)
 
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer('cos_cached', emb.cos(), persistent=False)
-        self.register_buffer('sin_cached', emb.sin(), persistent=False)
-
-    def forward(self):
+    def __call__(self) -> CosSin:
         return self.cos_cached, self.sin_cached
 
 
-class Attention(nn.Module):
-    def __init__(
-        self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False
-    ):
-        super().__init__()
+class Attention(eqx.Module):
+    hidden_size: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    output_size: int = eqx.field(static=True)
+    num_heads: int = eqx.field(static=True)
+    num_key_value_heads: int = eqx.field(static=True)
+    causal: bool = eqx.field(static=True)
 
+    qkv_proj: CastedLinear
+    o_proj: CastedLinear
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        num_heads: int,
+        num_key_value_heads: int,
+        causal: bool,
+        *,
+        key,
+    ):
         self.hidden_size = hidden_size
         self.head_dim = head_dim
-        self.output_size = head_dim * num_heads
+        self.output_size = num_heads * head_dim
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
 
+        k_qkv, k_o = jax.random.split(key)
         self.qkv_proj = CastedLinear(
-            self.hidden_size,
-            (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
+            hidden_size,
+            (num_heads + 2 * num_key_value_heads) * head_dim,
             bias=False,
+            key=k_qkv,
         )
-        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+        self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False, key=k_o)
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
+    def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray) -> jnp.ndarray:
+        out_dtype = hidden_states.dtype
+        b, s, _ = hidden_states.shape
 
         qkv = self.qkv_proj(hidden_states)
-
-        qkv = qkv.view(
-            batch_size,
-            seq_len,
-            self.num_heads + 2 * self.num_key_value_heads,
-            self.head_dim,
+        qkv = qkv.reshape(
+            b, s, self.num_heads + 2 * self.num_key_value_heads, self.head_dim
         )
-        query = qkv[:, :, : self.num_heads]
-        key = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
-        value = qkv[:, :, self.num_heads + self.num_key_value_heads :]
+
+        q = qkv[:, :, : self.num_heads]
+        k = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
+        v = qkv[:, :, self.num_heads + self.num_key_value_heads :]
 
         if cos_sin is not None:
             cos, sin = cos_sin
-            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+            cos = cos[:s]
+            sin = sin[:s]
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        query, key, value = map(
-            lambda t: einops.rearrange(t, "B S H D -> B H S D"), (query, key, value)
-        )
-        attn_output = scaled_dot_product_attention(
-            query=query, key=key, value=value, is_causal=self.causal
-        )
-        attn_output = einops.rearrange(attn_output, "B H S D -> B S H D")
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)
-        return self.o_proj(attn_output)
+        q = q.astype(jnp.float32)
+        k = k.astype(jnp.float32)
+        v = v.astype(jnp.float32)
+
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_scores = jnp.einsum("bthd,bshd->bhts", q, k) * scale
+
+        if self.causal:
+            mask = jnp.tril(jnp.ones((s, s), dtype=bool))
+            attn_scores = jnp.where(
+                mask[None, None, :, :],
+                attn_scores,
+                jnp.full_like(attn_scores, -1e30),
+            )
+
+        attn = jax.nn.softmax(attn_scores, axis=-1)
+        out = jnp.einsum("bhts,bshd->bthd", attn, v)
+        out = out.reshape(b, s, self.output_size)
+
+        out = out.astype(out_dtype)
+        return self.o_proj(out)
 
 
-class LinearSwish(nn.Module):
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        self.linear = CastedLinear(hidden_size, hidden_size, bias=False)
+class SwiGLU(eqx.Module):
+    gate_up_proj: CastedLinear
+    down_proj: CastedLinear
+    hidden_size: int = eqx.field(static=True)
+    expansion: float = eqx.field(static=True)
 
-    def forward(self, x):
-        return self.linear(F.silu(x))
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, expansion: float):
-        super().__init__()
+    def __init__(self, hidden_size: int, expansion: float, *, key):
+        self.hidden_size = hidden_size
+        self.expansion = expansion
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
+        gate_key, down_key = jax.random.split(key)
+        self.gate_up_proj = CastedLinear(
+            hidden_size, inter * 2, bias=False, key=gate_key
+        )
+        self.down_proj = CastedLinear(inter, hidden_size, bias=False, key=down_key)
 
-        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
-        self.down_proj = CastedLinear(inter, hidden_size, bias=False)
-
-    def forward(self, x):
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(F.silu(gate) * up)
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
+        return self.down_proj(jax.nn.silu(gate) * up)
 
 
-def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-
-    variance = hidden_states.square().mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
-    return hidden_states.to(input_dtype)
+def rms_norm(hidden_states: jnp.ndarray, variance_epsilon: float) -> jnp.ndarray:
+    orig_dtype = hidden_states.dtype
+    hidden_states = hidden_states.astype(jnp.float32)
+    variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
+    hidden_states = hidden_states * jax.lax.rsqrt(variance + variance_epsilon)
+    return hidden_states.astype(orig_dtype)

@@ -1,105 +1,91 @@
-from typing import Any, Tuple, Dict, Sequence, Optional
+from typing import Dict, Sequence, Tuple
 
-import torch
-import torch.nn.functional as F
-from torch import nn
+import jax.numpy as jnp
+import optax
+
+from trm.model import Carry, Model
 
 IGNORE_LABEL_ID = -100
 
 
-def s(x, epsilon=1e-30):
-    return torch.where(x < 0, 1 / (1 - x + epsilon), x + 1)
+def s(x: jnp.ndarray, epsilon: float = 1e-30) -> jnp.ndarray:
+    return jnp.where(x < 0, 1 / (1 - x + epsilon), x + 1)
 
 
-def log_stablemax(x, dim=-1):
+def log_stablemax(x: jnp.ndarray, axis: int = -1) -> jnp.ndarray:
     s_x = s(x)
-    return torch.log(s_x / torch.sum(s_x, dim=dim, keepdim=True))
+    return jnp.log(s_x) - jnp.log(jnp.sum(s_x, axis=axis, keepdims=True))
 
 
-def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
-    logprobs = log_stablemax(logits.to(torch.float64), dim=-1)
-
+def stablemax_cross_entropy(
+    logits: jnp.ndarray,
+    labels: jnp.ndarray,
+    ignore_index: int = IGNORE_LABEL_ID,
+    valid_mask: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    logprobs = log_stablemax(logits.astype(jnp.float64), axis=-1)
     if valid_mask is None:
         valid_mask = labels != ignore_index
-    transformed_labels = torch.where(valid_mask, labels, 0)
-    prediction_logprobs = torch.gather(
-        logprobs, index=transformed_labels.to(torch.long).unsqueeze(-1), dim=-1
+    transformed_labels = jnp.where(valid_mask, labels, 0)
+    prediction_logprobs = jnp.take_along_axis(
+        logprobs, transformed_labels[..., None], axis=-1
     ).squeeze(-1)
+    return -jnp.where(valid_mask, prediction_logprobs, 0.0)
 
-    return -torch.where(valid_mask, prediction_logprobs, 0)
 
+def act_loss(
+    model: Model,
+    carry: Carry,
+    rng: jnp.ndarray,
+    return_keys: Sequence[str],
+    *,
+    training: bool,
+) -> Tuple[Carry, jnp.ndarray, Dict[str, jnp.ndarray], Dict[str, jnp.ndarray], jnp.ndarray]:
+    new_carry, outputs = model(carry, rng=rng, training=training)
+    labels = new_carry.current_data["labels"]
+    logits = outputs["logits"]
+    q_halt_logits = outputs["q_halt_logits"]
+    preds = jnp.argmax(logits, axis=-1)
+    outputs = dict(outputs)
+    outputs["preds"] = preds
 
-class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module):
-        super().__init__()
-        self.model = model
-        self.loss_fn = stablemax_cross_entropy
+    mask = labels != IGNORE_LABEL_ID
+    loss_counts = jnp.sum(mask, axis=-1)
+    loss_divisor = jnp.maximum(loss_counts, 1)[..., None]
+    is_correct = jnp.logical_and(preds == labels, mask)
+    seq_is_correct = jnp.sum(is_correct, axis=-1) == loss_counts
+    valid_metrics = jnp.logical_and(new_carry.halted, loss_counts > 0)
 
-    def initial_carry(self, *args, **kwargs):
-        return self.model.initial_carry(*args, **kwargs)
+    def reduce_metric(values):
+        return jnp.sum(jnp.where(valid_metrics, values, 0.0))
 
-    def forward(
-        self,
-        return_keys: Sequence[str],
-        **model_kwargs,
-    ) -> Tuple[
-        Any,
-        torch.Tensor,
-        Dict[str, torch.Tensor],
-        Optional[Dict[str, torch.Tensor]],
-        torch.Tensor,
-    ]:
+    metrics: Dict[str, jnp.ndarray] = {
+        "count": jnp.sum(valid_metrics.astype(jnp.float32)),
+        "accuracy": reduce_metric(
+            jnp.sum(is_correct.astype(jnp.float32) / loss_divisor, axis=-1)
+        ),
+        "exact_accuracy": reduce_metric(seq_is_correct.astype(jnp.float32)),
+        "q_halt_accuracy": reduce_metric(
+            (jnp.where(q_halt_logits >= 0, 1, 0) == seq_is_correct).astype(jnp.float32)
+        ),
+        "steps": reduce_metric(new_carry.steps.astype(jnp.float32)),
+    }
 
-        new_carry, outputs = self.model(**model_kwargs)
-        labels = new_carry.current_data["labels"]
+    lm_loss = jnp.sum(
+        stablemax_cross_entropy(logits, labels, valid_mask=mask) / loss_divisor
+    )
+    targets = seq_is_correct.astype(logits.dtype)
+    q_halt_loss = jnp.sum(
+        optax.sigmoid_binary_cross_entropy(logits=q_halt_logits, labels=targets)
+    )
+    metrics.update(
+        {
+            "lm_loss": lm_loss,
+            "q_halt_loss": q_halt_loss,
+        }
+    )
 
-        with torch.no_grad():
-            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
-
-            mask = labels != IGNORE_LABEL_ID
-            loss_counts = mask.sum(-1)
-            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
-            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
-            seq_is_correct = is_correct.sum(-1) == loss_counts
-
-            valid_metrics = new_carry.halted & (loss_counts > 0)
-            metrics = {
-                "count": valid_metrics.sum(),
-                "accuracy": torch.where(
-                    valid_metrics,
-                    (is_correct.to(torch.float32) / loss_divisor).sum(-1),
-                    0,
-                ).sum(),
-                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-                "q_halt_accuracy": (
-                    valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)
-                ).sum(),
-                "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
-            }
-
-        lm_loss = (
-            self.loss_fn(
-                outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask
-            )
-            / loss_divisor
-        ).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(
-            outputs["q_halt_logits"],
-            seq_is_correct.to(outputs["q_halt_logits"].dtype),
-            reduction="sum",
-        )
-        metrics.update(
-            {
-                "lm_loss": lm_loss.detach(),
-                "q_halt_loss": q_halt_loss.detach(),
-            }
-        )
-        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
-
-        return (
-            new_carry,
-            lm_loss + 0.5 * q_halt_loss,
-            metrics,
-            detached_outputs,
-            new_carry.halted.all(),
-        )
+    detached_outputs = {k: outputs[k] for k in return_keys if k in outputs}
+    total_loss = lm_loss + 0.5 * q_halt_loss
+    all_finish = jnp.all(new_carry.halted)
+    return new_carry, total_loss, metrics, detached_outputs, all_finish

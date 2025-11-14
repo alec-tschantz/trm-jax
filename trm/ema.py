@@ -1,42 +1,26 @@
-import copy
-import torch.nn as nn
+import equinox as eqx
+import jax.tree_util as jtu
 
 
-class EMAHelper(object):
-    def __init__(self, mu=0.999):
+class EMAHelper:
+    def __init__(self, mu: float):
         self.mu = mu
-        self.shadow = {}
+        self.shadow = None
 
-    def register(self, module):
-        if isinstance(module, nn.DataParallel):
-            module = module.module
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+    def register(self, params):
+        self.shadow = jtu.tree_map(lambda x: x, params)
 
-    def update(self, module):
-        if isinstance(module, nn.DataParallel):
-            module = module.module
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                self.shadow[name].data = (
-                    1.0 - self.mu
-                ) * param.data + self.mu * self.shadow[name].data
+    def update(self, params):
+        if self.shadow is None:
+            self.register(params)
+            return
 
-    def ema(self, module):
-        if isinstance(module, nn.DataParallel):
-            module = module.module
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.shadow[name].data)
+        def _update(ema_value, new_value):
+            if eqx.is_array(ema_value):
+                return self.mu * ema_value + (1.0 - self.mu) * new_value
+            return new_value
 
-    def ema_copy(self, module):
-        module_copy = copy.deepcopy(module)
-        self.ema(module_copy)
-        return module_copy
+        self.shadow = jtu.tree_map(_update, self.shadow, params)
 
-    def state_dict(self):
+    def ema_copy(self):
         return self.shadow
-
-    def load_state_dict(self, state_dict):
-        self.shadow = state_dict

@@ -1,37 +1,23 @@
-from typing import Tuple, List, Dict
-from dataclasses import dataclass
 import math
-import torch
-import torch.nn.functional as F
-from torch import nn
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 from pydantic import BaseModel
 
-
-from trm.utils import trunc_normal_init_
 from trm.layers import (
-    rms_norm,
-    SwiGLU,
     Attention,
-    RotaryEmbedding,
     CastedEmbedding,
     CastedLinear,
     CosSin,
+    RotaryEmbedding,
+    SwiGLU,
+    rms_norm,
 )
 from trm.sparse_embedding import CastedSparseEmbedding
-
-
-@dataclass
-class InnerCarry:
-    z_H: torch.Tensor
-    z_L: torch.Tensor
-
-
-@dataclass
-class Carry:
-    inner_carry: InnerCarry
-    steps: torch.Tensor
-    halted: torch.Tensor
-    current_data: Dict[str, torch.Tensor]
+from trm.utils import trunc_normal
 
 
 class ModelConfig(BaseModel):
@@ -51,208 +37,256 @@ class ModelConfig(BaseModel):
     rope_theta: float = 10000.0
     halt_max_steps: int
     halt_exploration_prob: float
-    forward_dtype: str = "bfloat16"
+    forward_dtype: str = "float32"
     puzzle_emb_len: int = 16
 
 
-class Block(nn.Module):
-    def __init__(self, config: ModelConfig) -> None:
-        super().__init__()
+class InnerCarry(eqx.Module):
+    z_H: jnp.ndarray
+    z_L: jnp.ndarray
+
+
+class Carry(eqx.Module):
+    inner_carry: InnerCarry
+    steps: jnp.ndarray
+    halted: jnp.ndarray
+    current_data: Dict[str, jnp.ndarray]
+
+
+class Block(eqx.Module):
+    self_attn: Attention
+    mlp: SwiGLU
+    norm_eps: float = eqx.field(static=True)
+
+    def __init__(self, config: ModelConfig, *, key):
+        k1, k2 = jax.random.split(key)
         self.self_attn = Attention(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
             causal=False,
+            key=k1,
         )
-        self.mlp = SwiGLU(hidden_size=config.hidden_size, expansion=config.expansion)
+        self.mlp = SwiGLU(
+            hidden_size=config.hidden_size,
+            expansion=config.expansion,
+            key=k2,
+        )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = rms_norm(
-            hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
-            variance_epsilon=self.norm_eps,
-        )
-        out = self.mlp(hidden_states)
-        return rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+    def __call__(self, cos_sin: CosSin, h: jnp.ndarray) -> jnp.ndarray:
+        @jax.checkpoint
+        def _block(h):
+            dtype = h.dtype
+            attn_out = self.self_attn(cos_sin, h)
+            h2 = rms_norm(h + attn_out.astype(dtype), variance_epsilon=self.norm_eps)
+            mlp_out = self.mlp(h2)
+            return rms_norm(h2 + mlp_out.astype(dtype), variance_epsilon=self.norm_eps)
+
+        return _block(h)
 
 
-class ReasoningModule(nn.Module):
-    def __init__(self, layers: List[Block]):
-        super().__init__()
-        self.layers = nn.ModuleList(layers)
+class ReasoningModule(eqx.Module):
+    layers: Tuple[Block, ...]
 
-    def forward(
-        self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
-        hidden_states = hidden_states + input_injection
+    def __call__(
+        self, h: jnp.ndarray, inj: jnp.ndarray, cos_sin: CosSin
+    ) -> jnp.ndarray:
+        h = h + inj
         for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
-        return hidden_states
+            h = layer(cos_sin, h)
+        return h
 
 
-class Inner(nn.Module):
-    def __init__(self, config: ModelConfig) -> None:
-        super().__init__()
+class Inner(eqx.Module):
+    config: ModelConfig = eqx.field(static=True)
+    forward_dtype: jnp.dtype = eqx.field(static=True)
+    embed_scale: float = eqx.field(static=True)
+    puzzle_emb_len: int = eqx.field(static=True)
+
+    embed_tokens: CastedEmbedding
+    lm_head: CastedLinear
+    q_head: CastedLinear
+    puzzle_emb: CastedSparseEmbedding
+    rotary_emb: RotaryEmbedding
+    L_level: ReasoningModule
+    H_init: jnp.ndarray
+    L_init: jnp.ndarray
+
+    def __init__(self, config: ModelConfig, *, key):
         self.config = config
-        self.forward_dtype = getattr(torch, self.config.forward_dtype)
-        self.embed_scale = math.sqrt(self.config.hidden_size)
+        dtype = getattr(jnp, config.forward_dtype)
+        self.forward_dtype = dtype
+        self.embed_scale = math.sqrt(config.hidden_size)
+        self.puzzle_emb_len = config.puzzle_emb_len
         embed_init_std = 1.0 / self.embed_scale
+
+        k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
+
         self.embed_tokens = CastedEmbedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
+            config.vocab_size,
+            config.hidden_size,
             init_std=embed_init_std,
-            cast_to=self.forward_dtype,
+            key=k1,
+            cast_to=dtype,
         )
         self.lm_head = CastedLinear(
-            self.config.hidden_size, self.config.vocab_size, bias=False
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            key=k2,
         )
-        self.q_head = CastedLinear(self.config.hidden_size, 1, bias=True)
-        self.puzzle_emb_len = self.config.puzzle_emb_len
+        q_head = CastedLinear(config.hidden_size, 1, bias=True, key=k3)
+        q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
+        bias_val = jnp.full_like(q_head.bias, -5.0)
+        q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
+        self.q_head = q_head
+
         self.puzzle_emb = CastedSparseEmbedding(
-            self.config.num_puzzle_identifiers,
-            self.config.puzzle_emb_ndim,
-            batch_size=self.config.batch_size,
-            init_std=0,
-            cast_to=self.forward_dtype,
+            config.num_puzzle_identifiers,
+            config.puzzle_emb_ndim,
+            init_std=0.0,
+            cast_to=dtype,
+            key=k4,
         )
+
         self.rotary_emb = RotaryEmbedding(
-            dim=self.config.hidden_size // self.config.num_heads,
-            max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
-            base=self.config.rope_theta,
+            dim=config.hidden_size // config.num_heads,
+            max_position_embeddings=config.seq_len + config.puzzle_emb_len,
+            base=config.rope_theta,
         )
+
+        layer_keys = jax.random.split(k5, config.L_layers)
         self.L_level = ReasoningModule(
-            layers=[Block(self.config) for _i in range(self.config.L_layers)]
-        )
-        h_init_tensor = trunc_normal_init_(
-            torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1
-        )
-        self.register_buffer("H_init", h_init_tensor)
-        l_init_tensor = trunc_normal_init_(
-            torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1
-        )
-        self.register_buffer("L_init", l_init_tensor)
-        with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)
-
-    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        embedding = self.embed_tokens(input.to(torch.int32))
-        puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-        pad_count = (
-            self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-        )
-        if pad_count > 0:
-            puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
-        embedding = torch.cat(
-            (
-                puzzle_embedding.view(
-                    -1, self.puzzle_emb_len, self.config.hidden_size
-                ),
-                embedding,
-            ),
-            dim=-2,
-        )
-        return self.embed_scale * embedding
-
-    def empty_carry(self, batch_size: int):
-        return InnerCarry(
-            z_H=torch.empty(
-                batch_size,
-                self.config.seq_len + self.puzzle_emb_len,
-                self.config.hidden_size,
-                dtype=self.forward_dtype,
-            ),
-            z_L=torch.empty(
-                batch_size,
-                self.config.seq_len + self.puzzle_emb_len,
-                self.config.hidden_size,
-                dtype=self.forward_dtype,
-            ),
+            tuple(Block(config, key=kk) for kk in layer_keys)
         )
 
-    def reset_carry(self, reset_flag: torch.Tensor, carry: InnerCarry):
-        return InnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+        self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
+        self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
+
+    def _input_embeddings(self, inputs, puzzle_ids):
+        tok = self.embed_tokens(inputs.astype(jnp.int32))
+        puzz = self.puzzle_emb(puzzle_ids)
+
+        need = self.puzzle_emb_len * self.config.hidden_size - puzz.shape[-1]
+        if need > 0:
+            puzz = jnp.pad(puzz, ((0, 0), (0, need)))
+
+        puzz = puzz.reshape(-1, self.puzzle_emb_len, self.config.hidden_size)
+        emb = jnp.concatenate([puzz, tok], axis=1)
+        return (emb * self.embed_scale).astype(self.forward_dtype)
+
+    def empty_carry(self, bs):
+        z = jnp.zeros(
+            (bs, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size),
+            dtype=self.forward_dtype,
         )
+        return InnerCarry(z_H=z, z_L=z)
 
-    def forward(
-        self,
-        carry: InnerCarry,
-        batch: Dict[str, torch.Tensor],
-    ) -> Tuple[InnerCarry, torch.Tensor, torch.Tensor]:
-        seq_info = dict(cos_sin=self.rotary_emb())
-        input_embeddings = self._input_embeddings(
-            batch["inputs"], batch["puzzle_identifiers"]
-        )
-        z_H, z_L = carry.z_H, carry.z_L
-        with torch.no_grad():
-            for _H_step in range(self.config.H_cycles - 1):
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
-        new_carry = InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len :]
-        q_halt_logits = self.q_head(z_H[:, 0]).to(torch.float32).squeeze(-1)
-        return new_carry, output, q_halt_logits
+    def reset_carry(self, reset, c):
+        flag = reset.reshape((-1, 1, 1))
+        h0 = self.H_init[None, None, :]
+        l0 = self.L_init[None, None, :]
+        zH = jnp.where(flag, h0, c.z_H)
+        zL = jnp.where(flag, l0, c.z_L)
+        return InnerCarry(z_H=zH, z_L=zL)
 
+    def _run_L(self, z_L, inj, cos_sin):
+        z_L = z_L.astype(self.forward_dtype)
+        inj = inj.astype(self.forward_dtype)
 
-class Model(nn.Module):
-    def __init__(self, config_dict: dict):
-        super().__init__()
-        self.config = ModelConfig(**config_dict)
-        self.inner = Inner(self.config)
+        def step(h, _):
+            out = self.L_level(h, inj, cos_sin).astype(self.forward_dtype)
+            return out, None
 
-    @property
-    def puzzle_emb(self):
-        return self.inner.puzzle_emb
+        z_L, _ = jax.lax.scan(step, z_L, xs=None, length=self.config.L_cycles)
+        return z_L
 
-    def initial_carry(self, batch: Dict[str, torch.Tensor]):
-        batch_size = batch["inputs"].shape[0]
-        return Carry(
-            inner_carry=self.inner.empty_carry(batch_size),
-            steps=torch.zeros((batch_size,), dtype=torch.int32),
-            halted=torch.ones((batch_size,), dtype=torch.bool),
-            current_data={k: torch.empty_like(v) for k, v in batch.items()},
-        )
+    def _run_H(self, z_H, z_L, inp, cos_sin):
+        z_H = z_H.astype(self.forward_dtype)
+        z_L = z_L.astype(self.forward_dtype)
+        inp = inp.astype(self.forward_dtype)
 
-    def forward(
-        self,
-        carry: Carry,
-        batch: Dict[str, torch.Tensor],
-    ) -> Tuple[Carry, Dict[str, torch.Tensor]]:
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-        new_steps = torch.where(carry.halted, 0, carry.steps)
-        new_current_data = {
-            k: torch.where(
-                carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v
+        def step(carry, _):
+            zH, zL = carry
+            inj = (zH + inp).astype(self.forward_dtype)
+
+            zL_new = self._run_L(zL, inj, cos_sin)
+            zH_new = self.L_level(zH, zL_new, cos_sin).astype(self.forward_dtype)
+
+            zH_new = jax.lax.stop_gradient(zH_new)
+            zL_new = jax.lax.stop_gradient(zL_new)
+
+            return (zH_new, zL_new), None
+
+        if self.config.H_cycles > 1:
+            (z_H, z_L), _ = jax.lax.scan(
+                step, (z_H, z_L), None, length=self.config.H_cycles - 1
             )
-            for k, v in carry.current_data.items()
-        }
-        new_inner_carry, logits, q_halt_logits = self.inner(
-            new_inner_carry, new_current_data
+
+        return z_H, z_L
+
+    def __call__(self, carry, batch):
+        cos_sin = self.rotary_emb()
+        inp = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+
+        z_H, z_L = carry.z_H, carry.z_L
+
+        z_H, z_L = self._run_H(z_H, z_L, inp, cos_sin)
+
+        inj = (z_H + inp).astype(self.forward_dtype)
+        z_L = self._run_L(z_L, inj, cos_sin)
+        z_H = self.L_level(z_H, z_L, cos_sin).astype(self.forward_dtype)
+
+        new_carry = InnerCarry(
+            z_H=jax.lax.stop_gradient(z_H),
+            z_L=jax.lax.stop_gradient(z_L),
         )
-        outputs = {
-            "logits": logits,
-            "q_halt_logits": q_halt_logits,
-        }
-        with torch.no_grad():
-            new_steps = new_steps + 1
-            is_last_step = new_steps >= self.config.halt_max_steps
-            halted = is_last_step
-            if self.training and (self.config.halt_max_steps > 1):
-                halted = halted | (q_halt_logits > 0)
-                min_halt_steps = (
-                    torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob
-                ) * torch.randint_like(
-                    new_steps, low=2, high=self.config.halt_max_steps + 1
-                )
-                halted = halted & (new_steps >= min_halt_steps)
+
+        logits = self.lm_head(z_H).astype(jnp.float32)[:, self.puzzle_emb_len :, :]
+        qh = self.q_head(z_H[:, 0]).astype(jnp.float32).squeeze(-1)
+
+        return new_carry, logits, qh
+
+
+class Model(eqx.Module):
+    config: ModelConfig = eqx.field(static=True)
+    inner: Inner
+
+    def __init__(self, cfg, *, key):
+        config = ModelConfig(**cfg)
+        self.config = config
+        self.inner = Inner(config, key=key)
+
+    def initial_carry(self, batch):
+        bs = batch["inputs"].shape[0]
+        return Carry(
+            inner_carry=self.inner.empty_carry(bs),
+            steps=jnp.zeros((bs,), dtype=jnp.int32),
+            halted=jnp.ones((bs,), dtype=jnp.bool_),
+            current_data={k: jnp.zeros_like(v) for k, v in batch.items()},
+        )
+
+    def __call__(self, carry, rng, training: bool):
+        new_inner, logits, qh = self.inner(carry.inner_carry, carry.current_data)
+
+        new_steps = carry.steps + 1
+        is_last = new_steps >= self.config.halt_max_steps
+        halted = is_last
+
+        if training and self.config.halt_max_steps > 1:
+            halted = jnp.logical_or(halted, qh > 0)
+            rng_h, rng_m = jax.random.split(rng)
+            r = jax.random.uniform(rng_h, qh.shape)
+            sample = r < self.config.halt_exploration_prob
+            sampled_min = jax.random.randint(
+                rng_m, new_steps.shape, 2, self.config.halt_max_steps + 1, jnp.int32
+            )
+            min_steps = jnp.where(sample, sampled_min, jnp.zeros_like(sampled_min))
+            halted = jnp.logical_and(halted, new_steps >= min_steps)
+
         return (
-            Carry(new_inner_carry, new_steps, halted, new_current_data),
-            outputs,
+            Carry(new_inner, new_steps, halted, carry.current_data),
+            {"logits": logits, "q_halt_logits": qh},
         )
