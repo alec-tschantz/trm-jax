@@ -21,8 +21,6 @@ from trm_jax.ema import EMAHelper
 from trm_jax.optim import adam_atan2, sparse_sign_sgd
 
 jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_debug_nans", True)
-jax.config.update("jax_debug_infs", True)
 
 @dataclass
 class TrainConfig:
@@ -56,7 +54,7 @@ DEFAULT_CONFIG = TrainConfig(
     beta2=0.95,
     puzzle_emb_lr=1e-4,
     puzzle_emb_weight_decay=1.0,
-    project_name="maze-act-jax",
+    project_name="maze-act",
     run_name="default",
     seed=0,
     ema_rate=0.999,
@@ -71,7 +69,6 @@ DEFAULT_CONFIG = TrainConfig(
         num_heads=8,
         expansion=4,
         puzzle_emb_ndim=512,
-        # JAX: run forward in float32 to keep jit+grad numerically stable.
         forward_dtype="float32",
         puzzle_emb_len=16,
     ),

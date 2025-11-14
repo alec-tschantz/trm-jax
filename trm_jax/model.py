@@ -60,7 +60,6 @@ class ModelConfig(BaseModel):
     rope_theta: float = 10000.0
     halt_max_steps: int
     halt_exploration_prob: float
-    # Use float32 for JAX forward pass to avoid bf16+JIT gradient NaNs.
     forward_dtype: str = "float32"
     puzzle_emb_len: int = 16
 

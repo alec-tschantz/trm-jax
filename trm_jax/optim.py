@@ -63,7 +63,7 @@ def adam_atan2(
                 return None
             m_hat = m / bias_c1
             v_hat = v / bias_c2
-            denom = jnp.sqrt(v_hat * (b * b) + 1e-32)
+            denom = jnp.sqrt(v_hat * (b * b))
             atan_val = jnp.arctan2(m_hat, denom)
             return -(a * atan_val + weight_decay * p)
 
