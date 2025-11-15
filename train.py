@@ -13,6 +13,7 @@ import tqdm
 import wandb
 
 from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from logit_lens import evaluate_logit_lens
 from trm.losses import act_loss
 from trm.model import Carry, Model
 from trm.utils import EMAHelper
@@ -290,6 +291,7 @@ def _eval_rollout(
     _, _, aggregates, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
     return aggregates
 
+
 def evaluate_model(
     model: Model,
     dataloader: DataLoader,
@@ -465,6 +467,13 @@ def train_loop(config: TrainConfig):
             eval_logs = evaluate_model(eval_model, test_loader, rng=eval_step_rng)
             if eval_logs:
                 wandb.log(eval_logs, step=train_state.step)
+            evaluate_logit_lens(
+                eval_model,
+                batch_jnp,
+                train_metadata,
+                prepare_carry_fn=prepare_carry,
+                step=train_state.step,
+            )
 
     wandb.finish()
 

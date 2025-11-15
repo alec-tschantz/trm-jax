@@ -280,7 +280,6 @@ class Inner(eqx.Module):
         qh = self.q_head(z_H[:, 0]).astype(jnp.float32).squeeze(-1)
         return new_carry, logits, qh
 
-
 class Model(eqx.Module):
     config: ModelConfig = eqx.field(static=True)
     inner: Inner
