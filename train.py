@@ -234,7 +234,7 @@ def prepare_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> 
     )
 
 
-class EvalAggregates(NamedTuple):
+class EvalState(NamedTuple):
     accuracy: jnp.ndarray
     exact_accuracy: jnp.ndarray
     q_halt_accuracy: jnp.ndarray
@@ -242,9 +242,9 @@ class EvalAggregates(NamedTuple):
     lm_loss: jnp.ndarray
 
 
-def _zero_eval_aggregates(dtype=jnp.float32) -> EvalAggregates:
+def _zero_eval_state(dtype=jnp.float32) -> EvalState:
     zero = jnp.array(0.0, dtype=dtype)
-    return EvalAggregates(zero, zero, zero, zero, zero)
+    return EvalState(zero, zero, zero, zero, zero)
 
 
 @eqx.filter_jit
@@ -253,7 +253,7 @@ def _eval_rollout(
     carry: Carry,
     rng: jnp.ndarray,
     max_steps: int,
-) -> EvalAggregates:
+) -> EvalState:
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
 
     def cond_fn(state):
@@ -270,7 +270,7 @@ def _eval_rollout(
             return_keys=(),
             training=False,
         )
-        new_agg = EvalAggregates(
+        new_agg = EvalState(
             accuracy=agg.accuracy + metrics["accuracy"],
             exact_accuracy=agg.exact_accuracy + metrics["exact_accuracy"],
             q_halt_accuracy=agg.q_halt_accuracy + metrics["q_halt_accuracy"],
@@ -283,7 +283,7 @@ def _eval_rollout(
     init_state = (
         carry,
         rng,
-        _zero_eval_aggregates(),
+        _zero_eval_state(),
         jnp.array(0, dtype=jnp.int32),
         jnp.array(False),
     )
