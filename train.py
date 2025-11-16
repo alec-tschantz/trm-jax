@@ -39,6 +39,7 @@ class TrainConfig:
     seed: int
     ema_rate: float
     eval_every: int
+    logit_lens_every: int
     model: Dict[str, Any]
 
 
@@ -59,7 +60,8 @@ DEFAULT_CONFIG = TrainConfig(
     run_name="default",
     seed=0,
     ema_rate=0.999,
-    eval_every=500,
+    eval_every=1000,
+    logit_lens_every=200,
     model=dict(
         halt_exploration_prob=0.1,
         halt_max_steps=16,
@@ -344,13 +346,24 @@ def train_loop(config: TrainConfig):
         epochs_per_iter=config.epochs,
         global_batch_size=config.global_batch_size,
     )
-    test_loader, _ = create_dataloader(
+    test_loader, test_metadata = create_dataloader(
         config,
         "test",
         test_set_mode=True,
         epochs_per_iter=1,
         global_batch_size=config.global_batch_size,
     )
+
+    test_loader_iter = iter(test_loader)
+
+    def sample_test_batch():
+        nonlocal test_loader_iter
+        try:
+            _, batch, _ = next(test_loader_iter)
+        except StopIteration:
+            test_loader_iter = iter(test_loader)
+            _, batch, _ = next(test_loader_iter)
+        return batch
 
     train_state, optimizer, param_labels = init_train_state(config, train_metadata)
 
@@ -467,10 +480,16 @@ def train_loop(config: TrainConfig):
             eval_logs = evaluate_model(eval_model, test_loader, rng=eval_step_rng)
             if eval_logs:
                 wandb.log(eval_logs, step=train_state.step)
+        if (
+            config.logit_lens_every > 0
+            and train_state.step % config.logit_lens_every == 0
+        ):
+            lens_model = ema_helper.ema_copy()
+            test_batch = batch_to_jnp(sample_test_batch())
             evaluate_logit_lens(
-                eval_model,
-                batch_jnp,
-                train_metadata,
+                lens_model,
+                test_batch,
+                test_metadata,
                 prepare_carry_fn=prepare_carry,
                 step=train_state.step,
             )
