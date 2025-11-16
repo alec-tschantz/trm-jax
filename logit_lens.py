@@ -58,9 +58,7 @@ def _render_panel(
 ) -> Image.Image:
     colors = _tokens_to_color_grid(tokens, palette, grid_size)
     img = Image.fromarray(colors, mode="RGB")
-    img = img.resize(
-        (LOGIT_LENS_PANEL_SIZE, LOGIT_LENS_PANEL_SIZE), Image.NEAREST
-    )
+    img = img.resize((LOGIT_LENS_PANEL_SIZE, LOGIT_LENS_PANEL_SIZE), Image.NEAREST)
 
     canvas = Image.new(
         "RGB",
@@ -126,11 +124,12 @@ def _render_logit_lens_frames(
         if sample_labels is not None
         else _safe_tokens(sample_inputs)
     )
-    intro_left = _render_panel(
-        _safe_tokens(sample_inputs), palette, grid_size, "Input"
-    )
+    intro_left = _render_panel(_safe_tokens(sample_inputs), palette, grid_size, "Input")
     intro_right = _render_panel(
-        intro_right_tokens, palette, grid_size, "Label" if sample_labels is not None else "Input"
+        intro_right_tokens,
+        palette,
+        grid_size,
+        "Label" if sample_labels is not None else "Input",
     )
     intro_frame = _frame_from_panels(intro_left, intro_right, banner=None)
     frames.append(_pil_to_chw(intro_frame))
@@ -141,7 +140,10 @@ def _render_logit_lens_frames(
     for step_idx in range(steps):
         for h_idx in range(h_cycles):
             zh_panel = _render_panel(
-                _safe_tokens(zh_tokens[step_idx, h_idx]), palette, grid_size, f"ZH={h_idx}"
+                _safe_tokens(zh_tokens[step_idx, h_idx]),
+                palette,
+                grid_size,
+                f"ZH={h_idx}",
             )
             for l_idx in range(l_cycles):
                 zl_panel = _render_panel(
@@ -150,7 +152,9 @@ def _render_logit_lens_frames(
                     grid_size,
                     f"ZL={l_idx}",
                 )
-                combined = _frame_from_panels(zh_panel, zl_panel, banner=f"R={step_idx}")
+                combined = _frame_from_panels(
+                    zh_panel, zl_panel, banner=f"R={step_idx}"
+                )
                 frames.append(_pil_to_chw(combined))
 
     return np.stack(frames, axis=0).astype(np.uint8)

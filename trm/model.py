@@ -108,6 +108,8 @@ class Inner(eqx.Module):
     forward_dtype: jnp.dtype = eqx.field(static=True)
     embed_scale: float = eqx.field(static=True)
     puzzle_emb_len: int = eqx.field(static=True)
+    H_init: jnp.ndarray = eqx.field(static=True)
+    L_init: jnp.ndarray = eqx.field(static=True)
 
     embed_tokens: Embedding
     lm_head: Linear
@@ -115,8 +117,6 @@ class Inner(eqx.Module):
     puzzle_emb: SparseEmbedding
     rotary_emb: RotaryEmbedding
     L_level: ReasoningModule
-    H_init: jnp.ndarray
-    L_init: jnp.ndarray
 
     def __init__(self, config: ModelConfig, *, key):
         self.config = config
@@ -279,6 +279,7 @@ class Inner(eqx.Module):
         logits = self.lm_head(z_H).astype(jnp.float32)[:, self.puzzle_emb_len :, :]
         qh = self.q_head(z_H[:, 0]).astype(jnp.float32).squeeze(-1)
         return new_carry, logits, qh
+
 
 class Model(eqx.Module):
     config: ModelConfig = eqx.field(static=True)
