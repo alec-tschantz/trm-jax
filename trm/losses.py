@@ -32,10 +32,16 @@ def act_loss(
     return_keys: Sequence[str],
     *,
     training: bool,
+    sample_stochastic_states: bool,
 ) -> Tuple[
     Carry, jnp.ndarray, Dict[str, jnp.ndarray], Dict[str, jnp.ndarray], jnp.ndarray
 ]:
-    new_carry, outputs = model(carry, rng=rng, training=training)
+    new_carry, outputs = model(
+        carry,
+        rng=rng,
+        training=training,
+        sample_stochastic_states=sample_stochastic_states,
+    )
     labels = new_carry.current_data["labels"]
     logits = outputs["logits"]
     q_halt_logits = outputs["q_halt_logits"]

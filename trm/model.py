@@ -43,6 +43,8 @@ class ModelConfig(BaseModel):
 
     forward_dtype: str = "bfloat16"
     puzzle_emb_len: int = 16
+    stochastic_z_h: bool = False
+    stochastic_z_l: bool = False
 
 
 class InnerCarry(eqx.Module):
@@ -117,6 +119,8 @@ class Inner(eqx.Module):
     puzzle_emb: SparseEmbedding
     rotary_emb: RotaryEmbedding
     L_level: ReasoningModule
+    z_H_stochastic_head: Linear | None
+    z_L_stochastic_head: Linear | None
 
     def __init__(self, config: ModelConfig, *, key):
         self.config = config
@@ -128,7 +132,7 @@ class Inner(eqx.Module):
         self.puzzle_emb_len = config.puzzle_emb_len
         embed_init_std = 1.0 / self.embed_scale
 
-        k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
+        k1, k2, k3, k4, k5, k6, k7, k8, k9 = jax.random.split(key, 9)
 
         self.embed_tokens = Embedding(
             config.vocab_size,
@@ -185,6 +189,26 @@ class Inner(eqx.Module):
 
         self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
         self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
+        self.z_H_stochastic_head = (
+            Linear(
+                config.hidden_size,
+                config.hidden_size * 2,
+                bias=True,
+                key=k8,
+            )
+            if config.stochastic_z_h
+            else None
+        )
+        self.z_L_stochastic_head = (
+            Linear(
+                config.hidden_size,
+                config.hidden_size * 2,
+                bias=True,
+                key=k9,
+            )
+            if config.stochastic_z_l
+            else None
+        )
 
     def _input_embeddings(self, inputs: jnp.ndarray, puzzle_ids: jnp.ndarray):
         tok = self.embed_tokens(inputs.astype(jnp.int32))
@@ -218,19 +242,55 @@ class Inner(eqx.Module):
 
         return InnerCarry(z_H=zH, z_L=zL)
 
-    def _run_L(
-        self, z_L: jnp.ndarray, inj: jnp.ndarray, cos_sin: CosSin
+    def _maybe_sample_state(
+        self,
+        head: Linear | None,
+        state: jnp.ndarray,
+        rng: jnp.ndarray,
+        sample: bool,
     ) -> jnp.ndarray:
+        if head is None:
+            return state
+        params = head(state)
+        mean, logvar = jnp.split(params, 2, axis=-1)
+        mean = mean.astype(jnp.float32)
+        logvar = logvar.astype(jnp.float32)
+        if sample:
+            eps = jax.random.normal(rng, mean.shape, dtype=jnp.float32)
+            std = jnp.exp(0.5 * logvar)
+            sampled = mean + eps * std
+        else:
+            sampled = mean
+        return sampled.astype(self.forward_dtype)
+
+    def _run_L(
+        self,
+        z_L: jnp.ndarray,
+        inj: jnp.ndarray,
+        cos_sin: CosSin,
+        *,
+        rng: jnp.ndarray,
+        sample_stochastic: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         z_L = z_L.astype(self.forward_dtype)
         inj = inj.astype(self.forward_dtype)
 
-        def body(h, _):
+        def body(carry, _):
+            h, rng_in = carry
             h_out = self.L_level(h, inj, cos_sin).astype(self.forward_dtype)
-            return h_out, None
+            step_rng = rng_in
+            if self.z_L_stochastic_head is not None and sample_stochastic:
+                rng_in, step_rng = jax.random.split(rng_in)
+            h_out = self._maybe_sample_state(
+                self.z_L_stochastic_head, h_out, step_rng, sample_stochastic
+            )
+            return (h_out, rng_in), None
 
         body = eqx.filter_checkpoint(body)
-        z_L, _ = jax.lax.scan(body, z_L, xs=None, length=self.config.L_cycles)
-        return z_L
+        (z_L, rng), _ = jax.lax.scan(
+            body, (z_L, rng), xs=None, length=self.config.L_cycles
+        )
+        return z_L, rng
 
     def _run_H(
         self,
@@ -238,38 +298,76 @@ class Inner(eqx.Module):
         z_L: jnp.ndarray,
         inp: jnp.ndarray,
         cos_sin: CosSin,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        *,
+        rng: jnp.ndarray,
+        sample_stochastic: bool,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         z_H = z_H.astype(self.forward_dtype)
         z_L = z_L.astype(self.forward_dtype)
         inp = inp.astype(self.forward_dtype)
+        num_steps = max(self.config.H_cycles - 1, 0)
 
         def step(carry, _):
-            zH, zL = carry
+            zH, zL, rng_in = carry
 
             inj = (zH + inp).astype(self.forward_dtype)
-            zL_new = self._run_L(zL, inj, cos_sin)
+            zL_new, rng_in = self._run_L(
+                zL, inj, cos_sin, rng=rng_in, sample_stochastic=sample_stochastic
+            )
 
             zH_new = self.L_level(zH, zL_new, cos_sin).astype(self.forward_dtype)
+            step_rng = rng_in
+            if self.z_H_stochastic_head is not None and sample_stochastic:
+                rng_in, step_rng = jax.random.split(rng_in)
+            zH_new = self._maybe_sample_state(
+                self.z_H_stochastic_head, zH_new, step_rng, sample_stochastic
+            )
             zH_new = jax.lax.stop_gradient(zH_new)
             zL_new = jax.lax.stop_gradient(zL_new)
 
-            return (zH_new, zL_new), None
+            return (zH_new, zL_new, rng_in), None
 
-        (z_H, z_L), _ = jax.lax.scan(
-            step, (z_H, z_L), xs=None, length=self.config.H_cycles - 1
+        (z_H, z_L, rng), _ = jax.lax.scan(
+            step, (z_H, z_L, rng), xs=None, length=num_steps
         )
-        return z_H, z_L
+        return z_H, z_L, rng
 
-    def __call__(self, carry: InnerCarry, batch: Dict[str, jnp.ndarray]):
+    def __call__(
+        self,
+        carry: InnerCarry,
+        batch: Dict[str, jnp.ndarray],
+        rng: jnp.ndarray,
+        *,
+        sample_stochastic_states: bool,
+    ):
         cos_sin = self.rotary_emb()
         inp = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         z_H, z_L = carry.z_H, carry.z_L
 
-        z_H, z_L = self._run_H(z_H, z_L, inp, cos_sin)
+        z_H, z_L, rng = self._run_H(
+            z_H,
+            z_L,
+            inp,
+            cos_sin,
+            rng=rng,
+            sample_stochastic=sample_stochastic_states,
+        )
         inj = (z_H + inp).astype(self.forward_dtype)
-        z_L = self._run_L(z_L, inj, cos_sin)
+        z_L, rng = self._run_L(
+            z_L,
+            inj,
+            cos_sin,
+            rng=rng,
+            sample_stochastic=sample_stochastic_states,
+        )
         z_H = self.L_level(z_H, z_L, cos_sin).astype(self.forward_dtype)
+        step_rng = rng
+        if self.z_H_stochastic_head is not None and sample_stochastic_states:
+            rng, step_rng = jax.random.split(rng)
+        z_H = self._maybe_sample_state(
+            self.z_H_stochastic_head, z_H, step_rng, sample_stochastic_states
+        )
 
         new_carry = InnerCarry(
             z_H=jax.lax.stop_gradient(z_H),
@@ -299,8 +397,23 @@ class Model(eqx.Module):
             current_data={k: jnp.zeros_like(v) for k, v in batch.items()},
         )
 
-    def __call__(self, carry: Carry, rng, training: bool):
-        new_inner, logits, qh = self.inner(carry.inner_carry, carry.current_data)
+    def __call__(
+        self,
+        carry: Carry,
+        rng,
+        training: bool,
+        *,
+        sample_stochastic_states: bool | None = None,
+    ):
+        if sample_stochastic_states is None:
+            sample_stochastic_states = training
+        state_rng, rng = jax.random.split(rng)
+        new_inner, logits, qh = self.inner(
+            carry.inner_carry,
+            carry.current_data,
+            state_rng,
+            sample_stochastic_states=sample_stochastic_states,
+        )
 
         new_steps = carry.steps + 1
         is_last = new_steps >= self.config.halt_max_steps

@@ -40,6 +40,7 @@ class TrainConfig:
     ema_rate: float
     eval_every: int
     logit_lens_every: int
+    deterministic_eval: bool
     model: Dict[str, Any]
 
 
@@ -62,6 +63,7 @@ DEFAULT_CONFIG = TrainConfig(
     ema_rate=0.999,
     eval_every=1000,
     logit_lens_every=200,
+    deterministic_eval=True,
     model=dict(
         halt_exploration_prob=0.1,
         halt_max_steps=16,
@@ -74,6 +76,8 @@ DEFAULT_CONFIG = TrainConfig(
         puzzle_emb_ndim=512,
         forward_dtype="bfloat16",
         puzzle_emb_len=16,
+        stochastic_z_h=False,
+        stochastic_z_l=True,
     ),
 )
 
@@ -255,6 +259,8 @@ def _eval_rollout(
     carry: Carry,
     rng: jnp.ndarray,
     max_steps: int,
+    *,
+    sample_stochastic_states: bool,
 ) -> EvalState:
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
 
@@ -271,6 +277,7 @@ def _eval_rollout(
             rng=step_rng,
             return_keys=(),
             training=False,
+            sample_stochastic_states=sample_stochastic_states,
         )
         new_agg = EvalState(
             accuracy=agg.accuracy + metrics["accuracy"],
@@ -299,6 +306,7 @@ def evaluate_model(
     dataloader: DataLoader,
     *,
     rng: jnp.ndarray | None = None,
+    sample_stochastic_states: bool = False,
 ) -> Dict[str, float]:
     eval_rng = rng if rng is not None else jax.random.PRNGKey(0)
     totals = {
@@ -316,7 +324,13 @@ def evaluate_model(
         carry = model.initial_carry(batch_jnp)
         carry = prepare_carry(model, carry, batch_jnp)
         eval_rng, batch_rng = jax.random.split(eval_rng)
-        aggregates = _eval_rollout(model, carry, batch_rng, max_steps)
+        aggregates = _eval_rollout(
+            model,
+            carry,
+            batch_rng,
+            max_steps,
+            sample_stochastic_states=sample_stochastic_states,
+        )
         aggregates = jtu.tree_map(lambda x: float(x), aggregates)
         totals["accuracy"] += aggregates.accuracy
         totals["exact_accuracy"] += aggregates.exact_accuracy
@@ -383,6 +397,7 @@ def train_loop(config: TrainConfig):
     ema_helper.register(eqx.combine(train_state.params, train_state.static))
     static_model = train_state.static
     eval_rng = jax.random.PRNGKey(config.seed + 42)
+    logit_lens_rng = jax.random.PRNGKey(config.seed + 4242)
     max_grad_norm = config.grad_clip_norm
     clipper = (
         optax.clip_by_global_norm(max_grad_norm) if max_grad_norm is not None else None
@@ -402,6 +417,7 @@ def train_loop(config: TrainConfig):
                 rng=rng,
                 return_keys=(),
                 training=True,
+                sample_stochastic_states=True,
             )
             return loss / gb, (new_carry, metrics, loss)
 
@@ -477,7 +493,12 @@ def train_loop(config: TrainConfig):
         if config.eval_every > 0 and train_state.step % config.eval_every == 0:
             eval_model = ema_helper.ema_copy()
             eval_rng, eval_step_rng = jax.random.split(eval_rng)
-            eval_logs = evaluate_model(eval_model, test_loader, rng=eval_step_rng)
+            eval_logs = evaluate_model(
+                eval_model,
+                test_loader,
+                rng=eval_step_rng,
+                sample_stochastic_states=not config.deterministic_eval,
+            )
             if eval_logs:
                 wandb.log(eval_logs, step=train_state.step)
         if (
@@ -486,12 +507,15 @@ def train_loop(config: TrainConfig):
         ):
             lens_model = ema_helper.ema_copy()
             test_batch = batch_to_jnp(sample_test_batch())
+            logit_lens_rng, lens_step_rng = jax.random.split(logit_lens_rng)
             evaluate_logit_lens(
                 lens_model,
                 test_batch,
                 test_metadata,
                 prepare_carry_fn=prepare_carry,
                 step=train_state.step,
+                rng=lens_step_rng,
+                sample_stochastic_states=True,
             )
 
     wandb.finish()
