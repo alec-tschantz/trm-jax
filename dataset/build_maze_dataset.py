@@ -11,7 +11,7 @@ from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 
-from dataset import PuzzleDatasetMetadata
+from dataset import DatasetMetadata
 
 
 CHARSET = "# SGo"
@@ -128,7 +128,10 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         "puzzle_identifiers": np.array(results["puzzle_identifiers"], dtype=np.int32),
     }
 
-    metadata = PuzzleDatasetMetadata(
+    num_examples = results["inputs"].shape[0]
+    results["actions"] = np.zeros((num_examples, 0), dtype=np.int32)
+
+    metadata = DatasetMetadata(
         seq_len=int(math.prod(grid_size)),
         vocab_size=len(CHARSET) + 1,
         pad_id=0,
@@ -139,6 +142,8 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         mean_puzzle_examples=1,
         total_puzzles=len(results["group_indices"]) - 1,
         sets=["all"],
+        num_actions=0,
+        action_vocab_size=0,
     )
 
     save_dir = os.path.join(config.output_dir, set_name)

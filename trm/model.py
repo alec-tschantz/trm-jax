@@ -26,6 +26,8 @@ class ModelConfig(BaseModel):
     puzzle_emb_ndim: int
     num_puzzle_identifiers: int
     vocab_size: int
+    num_actions: int = 0
+    action_vocab_size: int = 0
 
     H_cycles: int
     L_cycles: int
@@ -43,8 +45,6 @@ class ModelConfig(BaseModel):
 
     forward_dtype: str = "bfloat16"
     puzzle_emb_len: int = 16
-    stochastic_z_h: bool = False
-    stochastic_z_l: bool = False
 
 
 class InnerCarry(eqx.Module):
@@ -110,17 +110,17 @@ class Inner(eqx.Module):
     forward_dtype: jnp.dtype = eqx.field(static=True)
     embed_scale: float = eqx.field(static=True)
     puzzle_emb_len: int = eqx.field(static=True)
+    sequence_prefix_len: int = eqx.field(static=True)
     H_init: jnp.ndarray = eqx.field(static=True)
     L_init: jnp.ndarray = eqx.field(static=True)
 
     embed_tokens: Embedding
+    action_emb: Embedding | None
     lm_head: Linear
     q_head: Linear
     puzzle_emb: SparseEmbedding
     rotary_emb: RotaryEmbedding
     L_level: ReasoningModule
-    z_H_stochastic_head: Linear | None
-    z_L_stochastic_head: Linear | None
 
     def __init__(self, config: ModelConfig, *, key):
         self.config = config
@@ -130,9 +130,10 @@ class Inner(eqx.Module):
 
         self.embed_scale = math.sqrt(config.hidden_size)
         self.puzzle_emb_len = config.puzzle_emb_len
+        self.sequence_prefix_len = self.puzzle_emb_len + config.num_actions
         embed_init_std = 1.0 / self.embed_scale
 
-        k1, k2, k3, k4, k5, k6, k7, k8, k9 = jax.random.split(key, 9)
+        k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(key, 8)
 
         self.embed_tokens = Embedding(
             config.vocab_size,
@@ -142,18 +143,30 @@ class Inner(eqx.Module):
             cast_to=dtype,
         )
 
+        self.action_emb = (
+            Embedding(
+                config.action_vocab_size,
+                config.hidden_size,
+                init_std=embed_init_std,
+                key=k2,
+                cast_to=dtype,
+            )
+            if config.num_actions > 0 and config.action_vocab_size > 0
+            else None
+        )
+
         self.lm_head = Linear(
             config.hidden_size,
             config.vocab_size,
             bias=False,
-            key=k2,
+            key=k3,
         )
 
         q_head = Linear(
             config.hidden_size,
             1,
             bias=True,
-            key=k3,
+            key=k4,
         )
         q_head = eqx.tree_at(
             lambda m: m.weight,
@@ -173,44 +186,26 @@ class Inner(eqx.Module):
             config.puzzle_emb_ndim,
             init_std=0.0,
             cast_to=dtype,
-            key=k4,
+            key=k5,
         )
 
         self.rotary_emb = RotaryEmbedding(
             dim=config.hidden_size // config.num_heads,
-            max_position_embeddings=config.seq_len + config.puzzle_emb_len,
+            max_position_embeddings=config.seq_len + self.sequence_prefix_len,
             base=config.rope_theta,
         )
 
-        layer_keys = jax.random.split(k5, config.L_layers)
+        layer_keys = jax.random.split(k6, config.L_layers)
         self.L_level = ReasoningModule(
             tuple(Block(config, key=kk) for kk in layer_keys)
         )
 
-        self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
-        self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
-        self.z_H_stochastic_head = (
-            Linear(
-                config.hidden_size,
-                config.hidden_size * 2,
-                bias=True,
-                key=k8,
-            )
-            if config.stochastic_z_h
-            else None
-        )
-        self.z_L_stochastic_head = (
-            Linear(
-                config.hidden_size,
-                config.hidden_size * 2,
-                bias=True,
-                key=k9,
-            )
-            if config.stochastic_z_l
-            else None
-        )
+        self.H_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
+        self.L_init = trunc_normal(k8, (config.hidden_size,), std=1.0).astype(dtype)
 
-    def _input_embeddings(self, inputs: jnp.ndarray, puzzle_ids: jnp.ndarray):
+    def _input_embeddings(
+        self, inputs: jnp.ndarray, puzzle_ids: jnp.ndarray, actions: jnp.ndarray | None
+    ):
         tok = self.embed_tokens(inputs.astype(jnp.int32))
 
         puzz = self.puzzle_emb(puzzle_ids)
@@ -219,14 +214,37 @@ class Inner(eqx.Module):
             puzz = jnp.pad(puzz, ((0, 0), (0, need)))
 
         puzz = puzz.reshape(-1, self.puzzle_emb_len, self.config.hidden_size)
-        emb = jnp.concatenate([puzz, tok], axis=1)
 
+        if self.config.num_actions > 0:
+            if actions is None:
+                action_tokens = jnp.zeros(
+                    (inputs.shape[0], self.config.num_actions), dtype=jnp.int32
+                )
+            else:
+                action_tokens = actions.astype(jnp.int32)
+            if self.action_emb is not None:
+                action_emb = self.action_emb(action_tokens)
+            else:
+                action_emb = jnp.zeros(
+                    (inputs.shape[0], self.config.num_actions, self.config.hidden_size),
+                    dtype=self.forward_dtype,
+                )
+        else:
+            action_emb = jnp.zeros(
+                (inputs.shape[0], 0, self.config.hidden_size), dtype=self.forward_dtype
+            )
+
+        emb = jnp.concatenate([puzz, action_emb, tok], axis=1)
         emb = (emb * self.embed_scale).astype(self.forward_dtype)
         return emb
 
     def empty_carry(self, bs: int) -> InnerCarry:
         z = jnp.zeros(
-            (bs, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size),
+            (
+                bs,
+                self.config.seq_len + self.sequence_prefix_len,
+                self.config.hidden_size,
+            ),
             dtype=self.forward_dtype,
         )
         return InnerCarry(z_H=z, z_L=z)
@@ -242,55 +260,22 @@ class Inner(eqx.Module):
 
         return InnerCarry(z_H=zH, z_L=zL)
 
-    def _maybe_sample_state(
-        self,
-        head: Linear | None,
-        state: jnp.ndarray,
-        rng: jnp.ndarray,
-        sample: bool,
-    ) -> jnp.ndarray:
-        if head is None:
-            return state
-        params = head(state)
-        mean, logvar = jnp.split(params, 2, axis=-1)
-        mean = mean.astype(jnp.float32)
-        logvar = logvar.astype(jnp.float32)
-        if sample:
-            eps = jax.random.normal(rng, mean.shape, dtype=jnp.float32)
-            std = jnp.exp(0.5 * logvar)
-            sampled = mean + eps * std
-        else:
-            sampled = mean
-        return sampled.astype(self.forward_dtype)
-
     def _run_L(
         self,
         z_L: jnp.ndarray,
         inj: jnp.ndarray,
         cos_sin: CosSin,
-        *,
-        rng: jnp.ndarray,
-        sample_stochastic: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> jnp.ndarray:
         z_L = z_L.astype(self.forward_dtype)
         inj = inj.astype(self.forward_dtype)
 
-        def body(carry, _):
-            h, rng_in = carry
+        def body(h, _):
             h_out = self.L_level(h, inj, cos_sin).astype(self.forward_dtype)
-            step_rng = rng_in
-            if self.z_L_stochastic_head is not None and sample_stochastic:
-                rng_in, step_rng = jax.random.split(rng_in)
-            h_out = self._maybe_sample_state(
-                self.z_L_stochastic_head, h_out, step_rng, sample_stochastic
-            )
-            return (h_out, rng_in), None
+            return h_out, None
 
         body = eqx.filter_checkpoint(body)
-        (z_L, rng), _ = jax.lax.scan(
-            body, (z_L, rng), xs=None, length=self.config.L_cycles
-        )
-        return z_L, rng
+        z_L, _ = jax.lax.scan(body, z_L, xs=None, length=self.config.L_cycles)
+        return z_L
 
     def _run_H(
         self,
@@ -298,83 +283,59 @@ class Inner(eqx.Module):
         z_L: jnp.ndarray,
         inp: jnp.ndarray,
         cos_sin: CosSin,
-        *,
-        rng: jnp.ndarray,
-        sample_stochastic: bool,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         z_H = z_H.astype(self.forward_dtype)
         z_L = z_L.astype(self.forward_dtype)
         inp = inp.astype(self.forward_dtype)
         num_steps = max(self.config.H_cycles - 1, 0)
 
         def step(carry, _):
-            zH, zL, rng_in = carry
+            zH, zL = carry
 
             inj = (zH + inp).astype(self.forward_dtype)
-            zL_new, rng_in = self._run_L(
-                zL, inj, cos_sin, rng=rng_in, sample_stochastic=sample_stochastic
-            )
+            zL_new = self._run_L(zL, inj, cos_sin)
 
             zH_new = self.L_level(zH, zL_new, cos_sin).astype(self.forward_dtype)
-            step_rng = rng_in
-            if self.z_H_stochastic_head is not None and sample_stochastic:
-                rng_in, step_rng = jax.random.split(rng_in)
-            zH_new = self._maybe_sample_state(
-                self.z_H_stochastic_head, zH_new, step_rng, sample_stochastic
-            )
             zH_new = jax.lax.stop_gradient(zH_new)
             zL_new = jax.lax.stop_gradient(zL_new)
 
-            return (zH_new, zL_new, rng_in), None
+            return (zH_new, zL_new), None
 
-        (z_H, z_L, rng), _ = jax.lax.scan(
-            step, (z_H, z_L, rng), xs=None, length=num_steps
-        )
-        return z_H, z_L, rng
+        (z_H, z_L), _ = jax.lax.scan(step, (z_H, z_L), xs=None, length=num_steps)
+        return z_H, z_L
 
     def __call__(
         self,
         carry: InnerCarry,
         batch: Dict[str, jnp.ndarray],
-        rng: jnp.ndarray,
-        *,
-        sample_stochastic_states: bool,
     ):
         cos_sin = self.rotary_emb()
-        inp = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        inp = self._input_embeddings(
+            batch["inputs"],
+            batch["puzzle_identifiers"],
+            batch.get("actions"),
+        )
 
         z_H, z_L = carry.z_H, carry.z_L
 
-        z_H, z_L, rng = self._run_H(
+        z_H, z_L = self._run_H(
             z_H,
             z_L,
             inp,
             cos_sin,
-            rng=rng,
-            sample_stochastic=sample_stochastic_states,
         )
         inj = (z_H + inp).astype(self.forward_dtype)
-        z_L, rng = self._run_L(
-            z_L,
-            inj,
-            cos_sin,
-            rng=rng,
-            sample_stochastic=sample_stochastic_states,
-        )
+        z_L = self._run_L(z_L, inj, cos_sin)
         z_H = self.L_level(z_H, z_L, cos_sin).astype(self.forward_dtype)
-        step_rng = rng
-        if self.z_H_stochastic_head is not None and sample_stochastic_states:
-            rng, step_rng = jax.random.split(rng)
-        z_H = self._maybe_sample_state(
-            self.z_H_stochastic_head, z_H, step_rng, sample_stochastic_states
-        )
 
         new_carry = InnerCarry(
             z_H=jax.lax.stop_gradient(z_H),
             z_L=jax.lax.stop_gradient(z_L),
         )
 
-        logits = self.lm_head(z_H).astype(jnp.float32)[:, self.puzzle_emb_len :, :]
+        logits = self.lm_head(z_H).astype(jnp.float32)[
+            :, self.sequence_prefix_len :, :
+        ]
         qh = self.q_head(z_H[:, 0]).astype(jnp.float32).squeeze(-1)
         return new_carry, logits, qh
 
@@ -402,17 +363,10 @@ class Model(eqx.Module):
         carry: Carry,
         rng,
         training: bool,
-        *,
-        sample_stochastic_states: bool | None = None,
     ):
-        if sample_stochastic_states is None:
-            sample_stochastic_states = training
-        state_rng, rng = jax.random.split(rng)
         new_inner, logits, qh = self.inner(
             carry.inner_carry,
             carry.current_data,
-            state_rng,
-            sample_stochastic_states=sample_stochastic_states,
         )
 
         new_steps = carry.steps + 1

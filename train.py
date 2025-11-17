@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 import tqdm
 import wandb
 
-from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from dataset import Dataset, DatasetConfig, DatasetMetadata
 from logit_lens import evaluate_logit_lens
 from trm.losses import act_loss
 from trm.model import Carry, Model
@@ -40,7 +40,6 @@ class TrainConfig:
     ema_rate: float
     eval_every: int
     logit_lens_every: int
-    deterministic_eval: bool
     model: Dict[str, Any]
 
 
@@ -63,7 +62,6 @@ DEFAULT_CONFIG = TrainConfig(
     ema_rate=0.999,
     eval_every=1000,
     logit_lens_every=200,
-    deterministic_eval=True,
     model=dict(
         halt_exploration_prob=0.1,
         halt_max_steps=16,
@@ -76,8 +74,6 @@ DEFAULT_CONFIG = TrainConfig(
         puzzle_emb_ndim=512,
         forward_dtype="bfloat16",
         puzzle_emb_len=16,
-        stochastic_z_h=False,
-        stochastic_z_l=True,
     ),
 )
 
@@ -94,8 +90,8 @@ class TrainState:
 
 
 def create_dataloader(config: TrainConfig, split: str, **kwargs):
-    dataset = PuzzleDataset(
-        PuzzleDatasetConfig(
+    dataset = Dataset(
+        DatasetConfig(
             seed=config.seed,
             dataset_paths=config.data_paths,
             rank=0,
@@ -115,7 +111,7 @@ def create_dataloader(config: TrainConfig, split: str, **kwargs):
 
 def create_model(
     config: TrainConfig,
-    train_metadata: PuzzleDatasetMetadata,
+    train_metadata: DatasetMetadata,
 ):
     model_cfg = dict(
         **config.model,
@@ -123,6 +119,8 @@ def create_model(
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
+        num_actions=train_metadata.num_actions,
+        action_vocab_size=train_metadata.action_vocab_size,
         causal=False,
     )
     key = jax.random.PRNGKey(config.seed)
@@ -178,7 +176,7 @@ def cosine_schedule_with_warmup_lr_lambda(
 
 def init_train_state(
     config: TrainConfig,
-    train_metadata: PuzzleDatasetMetadata,
+    train_metadata: DatasetMetadata,
 ):
     total_steps = int(
         config.epochs
@@ -259,8 +257,6 @@ def _eval_rollout(
     carry: Carry,
     rng: jnp.ndarray,
     max_steps: int,
-    *,
-    sample_stochastic_states: bool,
 ) -> EvalState:
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
 
@@ -277,7 +273,6 @@ def _eval_rollout(
             rng=step_rng,
             return_keys=(),
             training=False,
-            sample_stochastic_states=sample_stochastic_states,
         )
         new_agg = EvalState(
             accuracy=agg.accuracy + metrics["accuracy"],
@@ -306,7 +301,6 @@ def evaluate_model(
     dataloader: DataLoader,
     *,
     rng: jnp.ndarray | None = None,
-    sample_stochastic_states: bool = False,
 ) -> Dict[str, float]:
     eval_rng = rng if rng is not None else jax.random.PRNGKey(0)
     totals = {
@@ -329,7 +323,6 @@ def evaluate_model(
             carry,
             batch_rng,
             max_steps,
-            sample_stochastic_states=sample_stochastic_states,
         )
         aggregates = jtu.tree_map(lambda x: float(x), aggregates)
         totals["accuracy"] += aggregates.accuracy
@@ -368,16 +361,15 @@ def train_loop(config: TrainConfig):
         global_batch_size=config.global_batch_size,
     )
 
-    test_loader_iter = iter(test_loader)
+    def iterate_batches(dataloader: DataLoader):
+        while True:
+            for _, batch, _ in dataloader:
+                yield batch
+
+    test_batch_iter = iterate_batches(test_loader)
 
     def sample_test_batch():
-        nonlocal test_loader_iter
-        try:
-            _, batch, _ = next(test_loader_iter)
-        except StopIteration:
-            test_loader_iter = iter(test_loader)
-            _, batch, _ = next(test_loader_iter)
-        return batch
+        return next(test_batch_iter)
 
     train_state, optimizer, param_labels = init_train_state(config, train_metadata)
 
@@ -397,7 +389,6 @@ def train_loop(config: TrainConfig):
     ema_helper.register(eqx.combine(train_state.params, train_state.static))
     static_model = train_state.static
     eval_rng = jax.random.PRNGKey(config.seed + 42)
-    logit_lens_rng = jax.random.PRNGKey(config.seed + 4242)
     max_grad_norm = config.grad_clip_norm
     clipper = (
         optax.clip_by_global_norm(max_grad_norm) if max_grad_norm is not None else None
@@ -417,7 +408,6 @@ def train_loop(config: TrainConfig):
                 rng=rng,
                 return_keys=(),
                 training=True,
-                sample_stochastic_states=True,
             )
             return loss / gb, (new_carry, metrics, loss)
 
@@ -497,7 +487,6 @@ def train_loop(config: TrainConfig):
                 eval_model,
                 test_loader,
                 rng=eval_step_rng,
-                sample_stochastic_states=not config.deterministic_eval,
             )
             if eval_logs:
                 wandb.log(eval_logs, step=train_state.step)
@@ -507,15 +496,12 @@ def train_loop(config: TrainConfig):
         ):
             lens_model = ema_helper.ema_copy()
             test_batch = batch_to_jnp(sample_test_batch())
-            logit_lens_rng, lens_step_rng = jax.random.split(logit_lens_rng)
             evaluate_logit_lens(
                 lens_model,
                 test_batch,
                 test_metadata,
                 prepare_carry_fn=prepare_carry,
                 step=train_state.step,
-                rng=lens_step_rng,
-                sample_stochastic_states=True,
             )
 
     wandb.finish()

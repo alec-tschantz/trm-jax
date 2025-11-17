@@ -7,14 +7,13 @@ import pydantic
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from argdantic import ArgParser
 from pydantic import BaseModel
 
 
 IGNORE_LABEL_ID = -100
 
 
-class PuzzleDatasetMetadata(pydantic.BaseModel):
+class DatasetMetadata(pydantic.BaseModel):
     pad_id: int
     ignore_label_id: Optional[int]
     blank_identifier_id: int
@@ -25,9 +24,11 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
     mean_puzzle_examples: float
     total_puzzles: int
     sets: List[str]
+    num_actions: int = 0
+    action_vocab_size: int = 0
 
 
-class PuzzleDatasetConfig(pydantic.BaseModel):
+class DatasetConfig(pydantic.BaseModel):
     seed: int
     dataset_paths: List[str]
     global_batch_size: int
@@ -37,8 +38,8 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     num_replicas: int
 
 
-class PuzzleDataset(IterableDataset):
-    def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
+class Dataset(IterableDataset):
+    def __init__(self, config: DatasetConfig, split: str = "train"):
         super().__init__()
         self.config = config
         self.split = split
@@ -50,6 +51,8 @@ class PuzzleDataset(IterableDataset):
         prev_blank_identifier_id = None
         prev_sets = None
         prev_num_identifiers = None
+        prev_num_actions = None
+        prev_action_vocab = None
         mean_puzzle_examples = 0
         total_puzzles = 0
         total_groups = 0
@@ -64,6 +67,8 @@ class PuzzleDataset(IterableDataset):
                 prev_blank_identifier_id = current_metadata.blank_identifier_id
                 prev_sets = current_metadata.sets
                 prev_num_identifiers = current_metadata.num_puzzle_identifiers
+                prev_num_actions = current_metadata.num_actions
+                prev_action_vocab = current_metadata.action_vocab_size
             else:
                 assert prev_seq_len == current_metadata.seq_len
                 assert prev_vocab_size == current_metadata.vocab_size
@@ -72,6 +77,8 @@ class PuzzleDataset(IterableDataset):
                 assert prev_blank_identifier_id == current_metadata.blank_identifier_id
                 assert prev_sets == current_metadata.sets
                 assert prev_num_identifiers == current_metadata.num_puzzle_identifiers
+                assert prev_num_actions == current_metadata.num_actions
+                assert prev_action_vocab == current_metadata.action_vocab_size
             mean_puzzle_examples += (
                 current_metadata.mean_puzzle_examples * current_metadata.total_puzzles
             )
@@ -80,7 +87,7 @@ class PuzzleDataset(IterableDataset):
             num_identifiers += current_metadata.num_puzzle_identifiers
         mean_puzzle_examples = mean_puzzle_examples / total_puzzles
 
-        self.metadata = PuzzleDatasetMetadata(
+        self.metadata = DatasetMetadata(
             seq_len=prev_seq_len,
             vocab_size=prev_vocab_size,
             pad_id=prev_pad_id,
@@ -91,6 +98,8 @@ class PuzzleDataset(IterableDataset):
             mean_puzzle_examples=mean_puzzle_examples,
             total_puzzles=total_puzzles,
             sets=prev_sets,
+            num_actions=prev_num_actions or 0,
+            action_vocab_size=prev_action_vocab or 0,
         )
 
         assert (
@@ -103,9 +112,9 @@ class PuzzleDataset(IterableDataset):
         self._data = None
         self._iters = 0
 
-    def _load_metadata(self, dataset_path) -> PuzzleDatasetMetadata:
+    def _load_metadata(self, dataset_path) -> DatasetMetadata:
         with open(os.path.join(dataset_path, self.split, "dataset.json"), "r") as f:
-            return PuzzleDatasetMetadata(**json.load(f))
+            return DatasetMetadata(**json.load(f))
 
     def _lazy_load_dataset(self):
         if self._data is not None:
@@ -114,6 +123,7 @@ class PuzzleDataset(IterableDataset):
         field_mmap_modes = {
             "inputs": "r",
             "labels": "r",
+            "actions": "r",
             "puzzle_identifiers": None,
             "puzzle_indices": None,
             "group_indices": None,
@@ -126,15 +136,23 @@ class PuzzleDataset(IterableDataset):
                     set_name_ = set_name + str(i)
                 else:
                     set_name_ = set_name
-                self._data[set_name_] = {
-                    field_name: np.load(
-                        os.path.join(
-                            dataset_path, self.split, f"{set_name}__{field_name}.npy"
-                        ),
-                        mmap_mode=mmap_mode,
+                fields = {}
+                for field_name, mmap_mode in field_mmap_modes.items():
+                    file_path = os.path.join(
+                        dataset_path, self.split, f"{set_name}__{field_name}.npy"
                     )
-                    for field_name, mmap_mode in field_mmap_modes.items()
-                }
+                    if not os.path.exists(file_path):
+                        continue
+                    fields[field_name] = np.load(file_path, mmap_mode=mmap_mode)
+
+                if "actions" not in fields:
+                    num_examples = fields["inputs"].shape[0]
+                    action_dim = self.metadata.num_actions
+                    fields["actions"] = np.zeros(
+                        (num_examples, action_dim), dtype=np.int32
+                    )
+
+                self._data[set_name_] = fields
 
     def _collate_batch(self, batch):
         batch = {k: v.astype(np.int32) for k, v in batch.items()}
@@ -150,6 +168,7 @@ class PuzzleDataset(IterableDataset):
                 "inputs": self.metadata.pad_id,
                 "labels": IGNORE_LABEL_ID,
                 "puzzle_identifiers": self.metadata.blank_identifier_id,
+                "actions": 0,
             }
             batch = {
                 k: np.pad(
@@ -198,6 +217,7 @@ class PuzzleDataset(IterableDataset):
                     {
                         "inputs": dataset["inputs"][local_start:local_end],
                         "labels": dataset["labels"][local_start:local_end],
+                        "actions": dataset["actions"][local_start:local_end],
                         "puzzle_identifiers": dataset["puzzle_identifiers"][
                             puzzle_indices
                         ],
@@ -253,6 +273,7 @@ class PuzzleDataset(IterableDataset):
                     {
                         "inputs": dataset["inputs"][batch_indices],
                         "labels": dataset["labels"][batch_indices],
+                        "actions": dataset["actions"][batch_indices],
                         "puzzle_identifiers": dataset["puzzle_identifiers"][
                             batch_puzzle_indices
                         ],
