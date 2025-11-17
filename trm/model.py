@@ -43,8 +43,7 @@ class ModelConfig(BaseModel):
 
     forward_dtype: str = "bfloat16"
     puzzle_emb_len: int = 16
-    stochastic_z_h: bool = False
-    stochastic_z_l: bool = False
+    energy_step_size: float = 1.0
 
 
 class InnerCarry(eqx.Module):
@@ -59,7 +58,7 @@ class Carry(eqx.Module):
     current_data: Dict[str, jnp.ndarray]
 
 
-class Block(eqx.Module):
+class EnergyBlock(eqx.Module):
     self_attn: Attention
     mlp: SwiGLU
     norm_eps: float = eqx.field(static=True)
@@ -93,16 +92,43 @@ class Block(eqx.Module):
         return h3
 
 
-class ReasoningModule(eqx.Module):
-    layers: Tuple[Block, ...]
+class EnergyBackbone(eqx.Module):
+    layers: Tuple[EnergyBlock, ...]
 
     def __call__(
-        self, h: jnp.ndarray, inj: jnp.ndarray, cos_sin: CosSin
+        self, cos_sin: CosSin, state: jnp.ndarray, context: jnp.ndarray
     ) -> jnp.ndarray:
-        h = h + inj
+        hidden = state + context
         for layer in self.layers:
-            h = layer(cos_sin, h)
-        return h
+            hidden = layer(cos_sin, hidden)
+        return hidden
+
+
+class EnergyPredictor(eqx.Module):
+    backbone: EnergyBackbone
+    projection: Linear
+
+    def predict_energy(
+        self, state: jnp.ndarray, context: jnp.ndarray, cos_sin: CosSin
+    ) -> jnp.ndarray:
+        dtype = state.dtype
+        hidden = self.backbone(cos_sin, state.astype(dtype), context.astype(dtype))
+        energy_map = self.projection(hidden).astype(jnp.float32)
+        # mean over sequence and feature dims → (batch,)
+        return jnp.mean(energy_map, axis=(-1, -2))
+
+    def energy_grad(
+        self, state: jnp.ndarray, context: jnp.ndarray, cos_sin: CosSin
+    ) -> jnp.ndarray:
+        # Context and cos_sin are treated as constants w.r.t. the inner optimisation.
+        frozen_context = jax.lax.stop_gradient(context)
+        frozen_cos_sin = jax.lax.stop_gradient(cos_sin)
+
+        def energy_fn(z):
+            # scalar over the whole batch so grad(z) has same shape as z
+            return jnp.sum(self.predict_energy(z, frozen_context, frozen_cos_sin))
+
+        return jax.grad(energy_fn)(state)
 
 
 class Inner(eqx.Module):
@@ -118,9 +144,7 @@ class Inner(eqx.Module):
     q_head: Linear
     puzzle_emb: SparseEmbedding
     rotary_emb: RotaryEmbedding
-    L_level: ReasoningModule
-    z_H_stochastic_head: Linear | None
-    z_L_stochastic_head: Linear | None
+    energy_model: EnergyPredictor
 
     def __init__(self, config: ModelConfig, *, key):
         self.config = config
@@ -132,7 +156,7 @@ class Inner(eqx.Module):
         self.puzzle_emb_len = config.puzzle_emb_len
         embed_init_std = 1.0 / self.embed_scale
 
-        k1, k2, k3, k4, k5, k6, k7, k8, k9 = jax.random.split(key, 9)
+        k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(key, 8)
 
         self.embed_tokens = Embedding(
             config.vocab_size,
@@ -183,32 +207,19 @@ class Inner(eqx.Module):
         )
 
         layer_keys = jax.random.split(k5, config.L_layers)
-        self.L_level = ReasoningModule(
-            tuple(Block(config, key=kk) for kk in layer_keys)
+        backbone = EnergyBackbone(
+            tuple(EnergyBlock(config, key=kk) for kk in layer_keys)
         )
+        projection = Linear(
+            config.hidden_size,
+            1,
+            bias=True,
+            key=k6,
+        )
+        self.energy_model = EnergyPredictor(backbone=backbone, projection=projection)
 
-        self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
-        self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
-        self.z_H_stochastic_head = (
-            Linear(
-                config.hidden_size,
-                config.hidden_size * 2,
-                bias=True,
-                key=k8,
-            )
-            if config.stochastic_z_h
-            else None
-        )
-        self.z_L_stochastic_head = (
-            Linear(
-                config.hidden_size,
-                config.hidden_size * 2,
-                bias=True,
-                key=k9,
-            )
-            if config.stochastic_z_l
-            else None
-        )
+        self.H_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
+        self.L_init = trunc_normal(k8, (config.hidden_size,), std=1.0).astype(dtype)
 
     def _input_embeddings(self, inputs: jnp.ndarray, puzzle_ids: jnp.ndarray):
         tok = self.embed_tokens(inputs.astype(jnp.int32))
@@ -242,137 +253,96 @@ class Inner(eqx.Module):
 
         return InnerCarry(z_H=zH, z_L=zL)
 
-    def _maybe_sample_state(
+    @eqx.filter_checkpoint
+    def _energy_state_update(
         self,
-        head: Linear | None,
         state: jnp.ndarray,
-        rng: jnp.ndarray,
-        sample: bool,
+        context: jnp.ndarray,
+        cos_sin: CosSin,
     ) -> jnp.ndarray:
-        if head is None:
-            return state
-        params = head(state)
-        mean, logvar = jnp.split(params, 2, axis=-1)
-        mean = mean.astype(jnp.float32)
-        logvar = logvar.astype(jnp.float32)
-        if sample:
-            eps = jax.random.normal(rng, mean.shape, dtype=jnp.float32)
-            std = jnp.exp(0.5 * logvar)
-            sampled = mean + eps * std
-        else:
-            sampled = mean
-        return sampled.astype(self.forward_dtype)
+        """Single energy-descent step: state ← state − η ∇_state E(state, context)."""
+        state32 = state.astype(jnp.float32)
+        context32 = context.astype(jnp.float32)
+        grad = self.energy_model.energy_grad(state32, context32, cos_sin)
+        step = jnp.asarray(self.config.energy_step_size, dtype=state32.dtype)
+        new_state = state32 - step * grad
+        return new_state.astype(self.forward_dtype)
 
-    def _run_L(
+    def _run_low_energy_dynamics(
         self,
         z_L: jnp.ndarray,
         inj: jnp.ndarray,
         cos_sin: CosSin,
-        *,
-        rng: jnp.ndarray,
-        sample_stochastic: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        z_L = z_L.astype(self.forward_dtype)
+    ) -> jnp.ndarray:
+        """Low-level dynamics with memory-safe truncation.
+
+        - If L_cycles <= 0: return unchanged.
+        - If L_cycles == 1: single gradient-bearing step.
+        - If L_cycles > 1:
+            * L_cycles - 1 warmup steps with stop_gradient
+            * 1 final step with gradients.
+        """
         inj = inj.astype(self.forward_dtype)
 
-        def body(carry, _):
-            h, rng_in = carry
-            h_out = self.L_level(h, inj, cos_sin).astype(self.forward_dtype)
-            step_rng = rng_in
-            if self.z_L_stochastic_head is not None and sample_stochastic:
-                rng_in, step_rng = jax.random.split(rng_in)
-            h_out = self._maybe_sample_state(
-                self.z_L_stochastic_head, h_out, step_rng, sample_stochastic
-            )
-            return (h_out, rng_in), None
+        if self.config.L_cycles <= 0:
+            return z_L.astype(self.forward_dtype)
 
-        body = eqx.filter_checkpoint(body)
-        (z_L, rng), _ = jax.lax.scan(
-            body, (z_L, rng), xs=None, length=self.config.L_cycles
-        )
-        return z_L, rng
+        L = self.config.L_cycles
 
-    def _run_H(
+        # Warmup steps: no gradient (stop_gradient on the updated state)
+        def warm_body(_, state):
+            state2 = self._energy_state_update(state, inj, cos_sin)
+            return jax.lax.stop_gradient(state2)
+
+        if L > 1:
+            z_L = jax.lax.fori_loop(0, L - 1, warm_body, z_L)
+
+        # Final step WITH gradient
+        z_L = self._energy_state_update(z_L, inj, cos_sin)
+        return z_L
+
+    @eqx.filter_checkpoint
+    def _high_level_iteration(
         self,
         z_H: jnp.ndarray,
         z_L: jnp.ndarray,
         inp: jnp.ndarray,
         cos_sin: CosSin,
-        *,
-        rng: jnp.ndarray,
-        sample_stochastic: bool,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        z_H = z_H.astype(self.forward_dtype)
-        z_L = z_L.astype(self.forward_dtype)
-        inp = inp.astype(self.forward_dtype)
-        num_steps = max(self.config.H_cycles - 1, 0)
-
-        def step(carry, _):
-            zH, zL, rng_in = carry
-
-            inj = (zH + inp).astype(self.forward_dtype)
-            zL_new, rng_in = self._run_L(
-                zL, inj, cos_sin, rng=rng_in, sample_stochastic=sample_stochastic
-            )
-
-            zH_new = self.L_level(zH, zL_new, cos_sin).astype(self.forward_dtype)
-            step_rng = rng_in
-            if self.z_H_stochastic_head is not None and sample_stochastic:
-                rng_in, step_rng = jax.random.split(rng_in)
-            zH_new = self._maybe_sample_state(
-                self.z_H_stochastic_head, zH_new, step_rng, sample_stochastic
-            )
-            zH_new = jax.lax.stop_gradient(zH_new)
-            zL_new = jax.lax.stop_gradient(zL_new)
-
-            return (zH_new, zL_new, rng_in), None
-
-        (z_H, z_L, rng), _ = jax.lax.scan(
-            step, (z_H, z_L, rng), xs=None, length=num_steps
-        )
-        return z_H, z_L, rng
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """One H-level iteration: update z_L (low) then z_H (high) via energy steps."""
+        inj = (z_H + inp).astype(self.forward_dtype)
+        z_L = self._run_low_energy_dynamics(z_L, inj, cos_sin)
+        z_H = self._energy_state_update(z_H, z_L, cos_sin)
+        return z_H, z_L
 
     def __call__(
         self,
         carry: InnerCarry,
         batch: Dict[str, jnp.ndarray],
-        rng: jnp.ndarray,
-        *,
-        sample_stochastic_states: bool,
     ):
         cos_sin = self.rotary_emb()
         inp = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         z_H, z_L = carry.z_H, carry.z_L
+        total_iters = max(self.config.H_cycles, 1)
+        num_prep = max(total_iters - 1, 0)
 
-        z_H, z_L, rng = self._run_H(
-            z_H,
-            z_L,
-            inp,
-            cos_sin,
-            rng=rng,
-            sample_stochastic=sample_stochastic_states,
-        )
-        inj = (z_H + inp).astype(self.forward_dtype)
-        z_L, rng = self._run_L(
-            z_L,
-            inj,
-            cos_sin,
-            rng=rng,
-            sample_stochastic=sample_stochastic_states,
-        )
-        z_H = self.L_level(z_H, z_L, cos_sin).astype(self.forward_dtype)
-        step_rng = rng
-        if self.z_H_stochastic_head is not None and sample_stochastic_states:
-            rng, step_rng = jax.random.split(rng)
-        z_H = self._maybe_sample_state(
-            self.z_H_stochastic_head, z_H, step_rng, sample_stochastic_states
-        )
+        def stop_states(h, l):
+            return jax.lax.stop_gradient(h), jax.lax.stop_gradient(l)
 
-        new_carry = InnerCarry(
-            z_H=jax.lax.stop_gradient(z_H),
-            z_L=jax.lax.stop_gradient(z_L),
-        )
+        # H-level warmup: num_prep iterations, each with gradients internally
+        # but we stop_gradient at the boundary of each iteration.
+        def prep_body(_, states):
+            h, l = states
+            h, l = self._high_level_iteration(h, l, inp, cos_sin)
+            return stop_states(h, l)
+
+        z_H, z_L = jax.lax.fori_loop(0, num_prep, prep_body, (z_H, z_L))
+
+        # Final H-iteration WITH gradient through its inner L-dynamics and energy steps
+        z_H, z_L = self._high_level_iteration(z_H, z_L, inp, cos_sin)
+        stopped_h, stopped_l = stop_states(z_H, z_L)
+        new_carry = InnerCarry(z_H=stopped_h, z_L=stopped_l)
 
         logits = self.lm_head(z_H).astype(jnp.float32)[:, self.puzzle_emb_len :, :]
         qh = self.q_head(z_H[:, 0]).astype(jnp.float32).squeeze(-1)
@@ -402,17 +372,11 @@ class Model(eqx.Module):
         carry: Carry,
         rng,
         training: bool,
-        *,
-        sample_stochastic_states: bool | None = None,
     ):
-        if sample_stochastic_states is None:
-            sample_stochastic_states = training
-        state_rng, rng = jax.random.split(rng)
+        _, rng = jax.random.split(rng)
         new_inner, logits, qh = self.inner(
             carry.inner_carry,
             carry.current_data,
-            state_rng,
-            sample_stochastic_states=sample_stochastic_states,
         )
 
         new_steps = carry.steps + 1

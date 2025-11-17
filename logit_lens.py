@@ -164,10 +164,7 @@ def _inner_forward_with_states(
     model: Model,
     carry: InnerCarry,
     batch: Dict[str, jnp.ndarray],
-    rng: jnp.ndarray,
-    *,
-    sample_stochastic_states: bool,
-) -> tuple[InnerCarry, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[InnerCarry, jnp.ndarray, jnp.ndarray]:
     inner = model.inner
     cos_sin = inner.rotary_emb()
     inp = inner._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
@@ -175,44 +172,29 @@ def _inner_forward_with_states(
 
     z_H_traces = []
     z_L_traces = []
+    total_iters = max(inner.config.H_cycles, 1)
 
-    for _ in range(inner.config.H_cycles):
+    for _ in range(total_iters):
         inj = (z_H + inp).astype(inner.forward_dtype)
 
         l_cycle_states = []
         for _ in range(inner.config.L_cycles):
-            z_L = inner.L_level(z_L, inj, cos_sin).astype(inner.forward_dtype)
-            step_rng = rng
-            if (
-                inner.z_L_stochastic_head is not None
-                and sample_stochastic_states
-            ):
-                rng, step_rng = jax.random.split(rng)
-            z_L = inner._maybe_sample_state(
-                inner.z_L_stochastic_head, z_L, step_rng, sample_stochastic_states
-            )
+            z_L = inner._energy_state_update(z_L, inj, cos_sin)
             l_cycle_states.append(jax.lax.stop_gradient(z_L))
 
-        z_H = inner.L_level(z_H, z_L, cos_sin).astype(inner.forward_dtype)
-        step_rng = rng
-        if inner.z_H_stochastic_head is not None and sample_stochastic_states:
-            rng, step_rng = jax.random.split(rng)
-        z_H = inner._maybe_sample_state(
-            inner.z_H_stochastic_head, z_H, step_rng, sample_stochastic_states
-        )
+        z_H = inner._energy_state_update(z_H, z_L, cos_sin)
+        z_H_traces.append(jax.lax.stop_gradient(z_H))
+        if inner.config.L_cycles > 0:
+            z_L_traces.append(jnp.stack(l_cycle_states))
+        else:
+            empty_shape = (0,) + z_L.shape
+            z_L_traces.append(jnp.zeros(empty_shape, dtype=z_L.dtype))
+
         z_H = jax.lax.stop_gradient(z_H)
         z_L = jax.lax.stop_gradient(z_L)
 
-        z_H_traces.append(z_H)
-        z_L_traces.append(jnp.stack(l_cycle_states))
-
     new_carry = InnerCarry(z_H=z_H, z_L=z_L)
-    return (
-        new_carry,
-        jnp.stack(z_H_traces),
-        jnp.stack(z_L_traces),
-        rng,
-    )
+    return new_carry, jnp.stack(z_H_traces), jnp.stack(z_L_traces)
 
 
 @eqx.filter_jit
@@ -221,8 +203,6 @@ def forward_with_logits(
     carry: Carry,
     *,
     max_steps: int | None = None,
-    rng: jnp.ndarray,
-    sample_stochastic_states: bool = True,
 ) -> tuple[Carry, jnp.ndarray, jnp.ndarray]:
     steps_to_run = model.config.halt_max_steps if max_steps is None else int(max_steps)
     inner_carry = carry.inner_carry
@@ -234,12 +214,10 @@ def forward_with_logits(
     zl_states = []
 
     for _ in range(steps_to_run):
-        inner_carry, zh_cycle, zl_cycle, rng = _inner_forward_with_states(
+        inner_carry, zh_cycle, zl_cycle = _inner_forward_with_states(
             model,
             inner_carry,
             current_data,
-            rng,
-            sample_stochastic_states=sample_stochastic_states,
         )
         zh_states.append(zh_cycle)
         zl_states.append(zl_cycle)
@@ -262,8 +240,6 @@ def evaluate_logit_lens(
     prepare_carry_fn,
     *,
     step: int,
-    rng: jnp.ndarray,
-    sample_stochastic_states: bool = True,
 ):
     if batch["inputs"].shape[0] == 0:
         return
@@ -275,12 +251,7 @@ def evaluate_logit_lens(
     }
     carry = model.initial_carry(single)
     carry = prepare_carry_fn(model, carry, single)
-    _, zh_hidden, zl_hidden = forward_with_logits(
-        model,
-        carry,
-        rng=rng,
-        sample_stochastic_states=sample_stochastic_states,
-    )
+    _, zh_hidden, zl_hidden = forward_with_logits(model, carry)
 
     palette = _build_logit_lens_palette(metadata.vocab_size)
     grid_size = int(round(math.sqrt(metadata.seq_len)))
