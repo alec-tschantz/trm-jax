@@ -15,11 +15,9 @@ from trm.model import Carry, InnerCarry, Model
 
 LOGIT_LENS_PANEL_SIZE = 256
 LOGIT_LENS_TITLE_HEIGHT = 24
-LOGIT_LENS_COLUMN_LABEL_HEIGHT = 28
+LOGIT_LENS_BANNER_HEIGHT = 28
 LOGIT_LENS_TITLE_BG = (242, 242, 242)
 LOGIT_LENS_TEXT_COLOR = (0, 0, 0)
-LOGIT_LENS_COLUMNS = 4
-LOGIT_LENS_ROWS = 4
 
 LOGIT_LENS_FONT = ImageFont.load_default()
 
@@ -77,34 +75,32 @@ def _render_panel(
     return canvas
 
 
-def _stack_column(panels: List[Image.Image], label: str) -> Image.Image:
-    width = panels[0].width
-    total_height = LOGIT_LENS_COLUMN_LABEL_HEIGHT + sum(panel.height for panel in panels)
-    column = Image.new("RGB", (width, total_height), LOGIT_LENS_TITLE_BG)
-    draw = ImageDraw.Draw(column)
-    if label:
+def _compose_frame(
+    zh_panel: Image.Image,
+    zl_panel: Image.Image,
+    input_panel: Image.Image,
+    output_panel: Image.Image,
+    banner: str,
+) -> Image.Image:
+    width = zh_panel.width + zl_panel.width
+    panel_height = zh_panel.height
+    total_height = LOGIT_LENS_BANNER_HEIGHT + panel_height * 2
+    canvas = Image.new("RGB", (width, total_height), LOGIT_LENS_TITLE_BG)
+    draw = ImageDraw.Draw(canvas)
+    if banner:
         draw.text(
-            (width // 2, LOGIT_LENS_COLUMN_LABEL_HEIGHT // 2),
-            label,
+            (width // 2, LOGIT_LENS_BANNER_HEIGHT // 2),
+            banner,
             font=LOGIT_LENS_FONT,
             fill=LOGIT_LENS_TEXT_COLOR,
             anchor="mm",
         )
-    offset = LOGIT_LENS_COLUMN_LABEL_HEIGHT
-    for panel in panels:
-        column.paste(panel, (0, offset))
-        offset += panel.height
-    return column
-
-
-def _combine_columns(columns: List[Image.Image]) -> Image.Image:
-    width = sum(column.width for column in columns)
-    height = max(column.height for column in columns)
-    canvas = Image.new("RGB", (width, height), LOGIT_LENS_TITLE_BG)
-    offset = 0
-    for column in columns:
-        canvas.paste(column, (offset, 0))
-        offset += column.width
+    offset_y = LOGIT_LENS_BANNER_HEIGHT
+    canvas.paste(zh_panel, (0, offset_y))
+    canvas.paste(zl_panel, (zh_panel.width, offset_y))
+    offset_y += panel_height
+    canvas.paste(input_panel, (0, offset_y))
+    canvas.paste(output_panel, (input_panel.width, offset_y))
     return canvas
 
 
@@ -130,14 +126,19 @@ def _render_logit_lens_frames(
 ) -> np.ndarray:
     frames: List[np.ndarray] = []
     total_steps = zh_tokens.shape[0]
-    label_tokens = (
+    h_cycles = zh_tokens.shape[1] if zh_tokens.ndim >= 2 else 0
+    l_cycles = zl_tokens.shape[2] if zl_tokens.ndim >= 3 else 0
+    if total_steps == 0 or h_cycles == 0 or l_cycles == 0:
+        return np.zeros((0, 3, 0, 0), dtype=np.uint8)
+
+    output_tokens = (
         _safe_tokens(sample_labels)
         if sample_labels is not None
         else _safe_tokens(sample_inputs)
     )
-    label_title = "Label" if sample_labels is not None else "Input"
+    output_title = "Output" if sample_labels is not None else "Input"
     input_panel = _render_panel(_safe_tokens(sample_inputs), palette, grid_size, "Input")
-    label_panel = _render_panel(label_tokens, palette, grid_size, label_title)
+    output_panel = _render_panel(output_tokens, palette, grid_size, output_title)
 
     def _format_action(actions_array: np.ndarray | None) -> str:
         if actions_array is None or actions_array.size == 0:
@@ -150,35 +151,24 @@ def _render_logit_lens_frames(
 
     action_suffix = _format_action(actions)
 
-    blank_tokens = np.zeros_like(sample_inputs)
-    blank_panel = _render_panel(blank_tokens, palette, grid_size, "")
-
-    for start in range(0, total_steps, LOGIT_LENS_COLUMNS):
-        columns: List[Image.Image] = []
-        for offset in range(LOGIT_LENS_COLUMNS):
-            step_idx = start + offset
-            if step_idx < total_steps:
-                zh_panel = _render_panel(
-                    _safe_tokens(zh_tokens[step_idx, -1]),
-                    palette,
-                    grid_size,
-                    "ZH",
-                )
+    for step_idx in range(total_steps):
+        for h_idx in range(h_cycles):
+            zh_panel = _render_panel(
+                _safe_tokens(zh_tokens[step_idx, h_idx]),
+                palette,
+                grid_size,
+                f"ZH H={h_idx}",
+            )
+            for l_idx in range(l_cycles):
                 zl_panel = _render_panel(
-                    _safe_tokens(zl_tokens[step_idx, -1, -1]),
+                    _safe_tokens(zl_tokens[step_idx, h_idx, l_idx]),
                     palette,
                     grid_size,
-                    "ZL",
+                    f"ZL L={l_idx}",
                 )
-                panels = [zh_panel, zl_panel, input_panel, label_panel]
-                label = f"R={step_idx}{action_suffix}"
-            else:
-                panels = [blank_panel] * LOGIT_LENS_ROWS
-                label = ""
-            columns.append(_stack_column(panels, label))
-
-        frame = _combine_columns(columns)
-        frames.append(_pil_to_chw(frame))
+                banner = f"R={step_idx} H={h_idx} L={l_idx}{action_suffix}"
+                frame = _compose_frame(zh_panel, zl_panel, input_panel, output_panel, banner)
+                frames.append(_pil_to_chw(frame))
 
     if not frames:
         return np.zeros((0, 3, 0, 0), dtype=np.uint8)
