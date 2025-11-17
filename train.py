@@ -78,7 +78,7 @@ DEFAULT_CONFIG = TrainConfig(
         forward_dtype="bfloat16",
         puzzle_emb_len=16,
         stochastic_z_h=False,
-        stochastic_z_l=True,
+        stochastic_z_l=False,
     ),
 )
 
@@ -369,17 +369,6 @@ def train_loop(config: TrainConfig):
         global_batch_size=config.global_batch_size,
     )
 
-    test_loader_iter = iter(test_loader)
-
-    def sample_test_batch():
-        nonlocal test_loader_iter
-        try:
-            _, batch, _ = next(test_loader_iter)
-        except StopIteration:
-            test_loader_iter = iter(test_loader)
-            _, batch, _ = next(test_loader_iter)
-        return batch
-
     train_state, optimizer, param_labels = init_train_state(config, train_metadata)
 
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
@@ -507,12 +496,11 @@ def train_loop(config: TrainConfig):
             and train_state.step % config.logit_lens_every == 0
         ):
             lens_model = ema_helper.ema_copy()
-            test_batch = batch_to_jnp(sample_test_batch())
             logit_lens_rng, lens_step_rng = jax.random.split(logit_lens_rng)
             evaluate_logit_lens(
                 lens_model,
-                test_batch,
-                test_metadata,
+                batch_jnp,
+                train_metadata,
                 prepare_carry_fn=prepare_carry,
                 step=train_state.step,
                 rng=lens_step_rng,

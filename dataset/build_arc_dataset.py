@@ -16,6 +16,8 @@ class ArcDatasetConfig(BaseModel):
     source_dir: str = "data/raw-arc3"
     output_dir: str = "data/arc3"
     train_fraction: float = 0.9
+    downsample_factor: int = 2
+    seed: int = 0
 
 
 def _init_split_store() -> Dict[str, List]:
@@ -35,6 +37,52 @@ def _stack_examples(examples: List[np.ndarray], seq_len: int) -> np.ndarray:
     return np.concatenate(examples, axis=0).astype(np.int32, copy=False)
 
 
+def _majority_vote(values: np.ndarray, rng: np.random.Generator) -> int:
+    counts = np.bincount(values)
+    max_count = counts.max()
+    candidates = np.flatnonzero(counts == max_count)
+    if candidates.size == 1 or rng is None:
+        return int(candidates[0])
+    idx = rng.integers(0, candidates.size)
+    return int(candidates[idx])
+
+
+def _downsample_grid(
+    grid: np.ndarray, factor: int, rng: np.random.Generator
+) -> np.ndarray:
+    if factor == 1:
+        return grid.copy()
+    h, w = grid.shape
+    if h % factor != 0 or w % factor != 0:
+        raise ValueError(
+            f"Grid size {grid.shape} is not divisible by factor {factor}."
+        )
+    new_h = h // factor
+    new_w = w // factor
+    reshaped = grid.reshape(new_h, factor, new_w, factor)
+    reshaped = reshaped.transpose(0, 2, 1, 3).reshape(new_h, new_w, factor * factor)
+    out = np.empty((new_h, new_w), dtype=grid.dtype)
+    for i in range(new_h):
+        for j in range(new_w):
+            block = reshaped[i, j].reshape(-1)
+            out[i, j] = _majority_vote(block, rng)
+    return out
+
+
+def _downsample_frames(
+    frames: np.ndarray, factor: int, rng: np.random.Generator
+) -> np.ndarray:
+    if factor == 1:
+        return frames.copy()
+    downsampled = np.empty(
+        (frames.shape[0], frames.shape[1] // factor, frames.shape[2] // factor),
+        dtype=frames.dtype,
+    )
+    for idx, frame in enumerate(frames):
+        downsampled[idx] = _downsample_grid(frame, factor, rng)
+    return downsampled
+
+
 def build_arc_dataset(config: ArcDatasetConfig):
     source_dir = config.source_dir
     files = sorted(
@@ -51,6 +99,7 @@ def build_arc_dataset(config: ArcDatasetConfig):
     vocab_max = 0
     splits = {"train": _init_split_store(), "test": _init_split_store()}
     puzzle_names: List[str] = []
+    rng = np.random.default_rng(config.seed)
 
     for idx, filename in enumerate(files):
         path = os.path.join(source_dir, filename)
@@ -67,6 +116,7 @@ def build_arc_dataset(config: ArcDatasetConfig):
         if frames.shape[0] < 2:
             continue
 
+        frames = _downsample_frames(frames, max(1, int(config.downsample_factor)), rng)
         grid_size = frames.shape[1]
         current_seq_len = grid_size * grid_size
         if seq_len is None:
@@ -76,7 +126,6 @@ def build_arc_dataset(config: ArcDatasetConfig):
                 f"Inconsistent seq_len {current_seq_len} encountered in {filename}"
             )
 
-        frames = np.array(frames, copy=True)
         frames[:, 0, 0] = actions
         vocab_max = max(vocab_max, int(frames.max()))
 
