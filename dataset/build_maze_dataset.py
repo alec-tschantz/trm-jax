@@ -10,12 +10,10 @@ from pydantic import BaseModel
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
-
 from dataset import PuzzleDatasetMetadata
 
 
 CHARSET = "# SGo"
-
 cli = ArgParser()
 
 

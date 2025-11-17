@@ -45,7 +45,8 @@ class TrainConfig:
 
 
 DEFAULT_CONFIG = TrainConfig(
-    data_paths=["data/maze-30x30-hard-1k"],
+    # data_paths=["data/maze-30x30-hard-1k"],
+    data_paths=["data/arc3"],
     global_batch_size=192,
     epochs=50000,
     lr=1e-4,

@@ -12,14 +12,25 @@ from dataset import PuzzleDatasetMetadata
 from trm.model import Carry, InnerCarry, Model
 
 
-LOGIT_LENS_CHARSET = "# SGo"
-LOGIT_LENS_COLOR_MAP = {
-    "#": (25, 25, 25),
-    " ": (242, 242, 242),
-    "S": (52, 168, 83),
-    "G": (234, 67, 53),
-    "o": (30, 136, 229),
-}
+LOGIT_LENS_FIXED_PALETTE = [
+    (120, 120, 120),
+    (25, 25, 25),
+    (242, 242, 242),
+    (52, 168, 83),
+    (234, 67, 53),
+    (30, 136, 229),
+    (255, 193, 7),
+    (142, 36, 170),
+    (0, 172, 193),
+    (255, 87, 34),
+    (121, 85, 72),
+    (205, 220, 57),
+    (63, 81, 181),
+    (244, 143, 177),
+    (255, 235, 59),
+    (0, 121, 107),
+    (233, 30, 99),
+]
 LOGIT_LENS_PANEL_SIZE = 256
 LOGIT_LENS_TITLE_HEIGHT = 24
 LOGIT_LENS_BANNER_HEIGHT = 28
@@ -30,13 +41,12 @@ LOGIT_LENS_FONT = ImageFont.load_default()
 
 
 def _build_logit_lens_palette(vocab_size: int) -> np.ndarray:
-    palette = np.zeros((vocab_size, 3), dtype=np.uint8)
-    palette[0] = np.array([120, 120, 120], dtype=np.uint8)
-    for idx, token in enumerate(LOGIT_LENS_CHARSET, start=1):
-        palette[idx] = np.array(
-            LOGIT_LENS_COLOR_MAP.get(token, (200, 200, 200)), dtype=np.uint8
-        )
-    return palette
+    base = np.asarray(LOGIT_LENS_FIXED_PALETTE, dtype=np.uint8)
+    if vocab_size <= base.shape[0]:
+        return base[:vocab_size]
+    repeats = int(np.ceil(vocab_size / base.shape[0]))
+    tiled = np.tile(base, (repeats, 1))
+    return tiled[:vocab_size]
 
 
 def _tokens_to_color_grid(tokens: np.ndarray, palette: np.ndarray, grid_size: int):
