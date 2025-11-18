@@ -136,30 +136,12 @@ class Model(eqx.Module):
             cast_to=dtype,
         )
 
-        self.lm_head = Linear(
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            key=k2,
-        )
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False, key=k2)
 
-        q_head = Linear(
-            config.hidden_size,
-            1,
-            bias=True,
-            key=k3,
-        )
-        q_head = eqx.tree_at(
-            lambda m: m.weight,
-            q_head,
-            jnp.zeros_like(q_head.weight),
-        )
+        q_head = Linear(config.hidden_size, 1, bias=True, key=k3)
+        q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
         bias_val = jnp.full_like(q_head.bias, -5.0)
-        q_head = eqx.tree_at(
-            lambda m: m.bias,
-            q_head,
-            bias_val,
-        )
+        q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
         self.q_head = q_head
 
         self.task_embed = SparseEmbedding(

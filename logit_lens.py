@@ -153,7 +153,8 @@ def _render_logit_lens_frames(
     frames: List[np.ndarray] = []
 
     num_iters = y_tokens.shape[0]
-    z_cycles = z_tokens.shape[1] if z_tokens.ndim >= 2 else 0
+    y_cycles = y_tokens.shape[1]
+    z_cycles = z_tokens.shape[2] if z_tokens.ndim >= 3 else 0
     input_panel = _render_panel(
         _safe_tokens(sample_inputs), palette, grid_size, "Input"
     )
@@ -167,56 +168,71 @@ def _render_logit_lens_frames(
     blank_tokens = np.zeros_like(sample_inputs)
 
     for iter_idx in range(num_iters):
-        y_panel = _render_panel(
-            _safe_tokens(y_tokens[iter_idx]),
-            palette,
-            grid_size,
-            f"y={iter_idx}",
-        )
-        if z_cycles == 0:
-            z_panel = _render_panel(blank_tokens, palette, grid_size, "z")
-            frame = _grid_from_panels(
-                y_panel,
-                z_panel,
-                input_panel,
-                output_panel,
-                banner=f"iter={iter_idx}",
-            )
-            frames.append(_pil_to_chw(frame))
-            continue
-
-        for z_idx in range(z_cycles):
-            z_panel = _render_panel(
-                _safe_tokens(z_tokens[iter_idx, z_idx]),
+        for y_idx in range(y_cycles):
+            y_panel = _render_panel(
+                _safe_tokens(y_tokens[iter_idx, y_idx]),
                 palette,
                 grid_size,
-                f"z={z_idx}",
+                f"y={y_idx}",
             )
-            frame = _grid_from_panels(
-                y_panel,
-                z_panel,
-                input_panel,
-                output_panel,
-                banner=f"iter={iter_idx}",
-            )
-            frames.append(_pil_to_chw(frame))
+            inner_cycles = max(z_cycles, 1)
+
+            for z_idx in range(inner_cycles):
+                if z_cycles == 0:
+                    z_panel = _render_panel(
+                        blank_tokens,
+                        palette,
+                        grid_size,
+                        "z",
+                    )
+                else:
+                    z_panel = _render_panel(
+                        _safe_tokens(z_tokens[iter_idx, y_idx, z_idx]),
+                        palette,
+                        grid_size,
+                        f"z={z_idx}",
+                    )
+                frame = _grid_from_panels(
+                    y_panel,
+                    z_panel,
+                    input_panel,
+                    output_panel,
+                    banner=f"iter={iter_idx}",
+                )
+                frames.append(_pil_to_chw(frame))
 
     return np.stack(frames, axis=0).astype(np.uint8)
 
 
 @eqx.filter_jit
-def _collect_state_histories(
+def _rollout_state_histories(
     model: Model,
     carry: Carry,
     rng: jnp.ndarray,
 ) -> tuple[Carry, jnp.ndarray, jnp.ndarray]:
-    new_carry, outputs = model(
-        carry,
-        rng=rng,
-        training=False,
-        record=True,
+    num_steps = max(int(model.config.halt_max_steps), 1)
+
+    def step_fn(state, _):
+        cur_carry, cur_rng = state
+        cur_rng, step_rng = jax.random.split(cur_rng)
+        new_carry, outputs = model(
+            cur_carry,
+            rng=step_rng,
+            training=False,
+            record=True,
+        )
+        return (new_carry, cur_rng), (
+            outputs["y_states"],
+            outputs["z_states"],
+        )
+
+    (final_carry, _), (y_histories, z_histories) = jax.lax.scan(
+        step_fn,
+        (carry, rng),
+        xs=None,
+        length=num_steps,
     )
-    return new_carry, outputs["y_states"], outputs["z_states"]
+    return final_carry, y_histories, z_histories
 
 
 def evaluate_logit_lens(
@@ -238,7 +254,7 @@ def evaluate_logit_lens(
     }
     carry = model.initial_carry(single)
     carry = filter_carry_fn(model, carry, single)
-    _, y_hidden, z_hidden = _collect_state_histories(model, carry, rng)
+    _, y_hidden, z_hidden = _rollout_state_histories(model, carry, rng)
 
     palette = _build_logit_lens_palette()
     grid_size = int(round(math.sqrt(metadata.seq_len)))
@@ -246,11 +262,9 @@ def evaluate_logit_lens(
     y_tokens = _hidden_to_tokens(y_hidden, model.lm_head, model.task_emb_len)
     z_tokens = _hidden_to_tokens(z_hidden, model.lm_head, model.task_emb_len)
 
-    y_tokens_np = np.asarray(jax.device_get(y_tokens))[:, 0, :]
-    z_tokens_np = np.asarray(jax.device_get(z_tokens))
-    z_tokens_np = z_tokens_np[:, :, 0, :]
-   
-        
+    y_tokens_np = np.take(np.asarray(jax.device_get(y_tokens)), 0, axis=2)
+    z_tokens_np = np.take(np.asarray(jax.device_get(z_tokens)), 0, axis=3)
+
     sample_inputs = np.asarray(jax.device_get(single["inputs"][0]))
     sample_labels = (
         np.asarray(jax.device_get(single["labels"][0])) if "labels" in single else None

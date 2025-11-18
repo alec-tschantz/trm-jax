@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import equinox as eqx
 
 from trm.model import Model
 from trm.nn import Linear
@@ -13,16 +14,15 @@ class EnergyConfig:
 
 
 class EnergyModel(Model):
+    energy_cfg: EnergyConfig = eqx.field(static=True)
+    energy_head: Linear
+
     def __init__(self, model_cfg: dict, energy_cfg: EnergyConfig, *, key):
         base_key, head_key = jax.random.split(key)
-        super().__init__(model_cfg, key=base_key)
         self.energy_cfg = energy_cfg
-        self.energy_head = Linear(
-            self.config.hidden_size,
-            1,
-            bias=True,
-            key=head_key,
-        )
+
+        super().__init__(model_cfg, key=base_key)
+        self.energy_head = Linear(self.config.hidden_size, 1, bias=True, key=head_key)
 
     def update_state(self, state, context, cos_sin):
         def energy_batch(s):
