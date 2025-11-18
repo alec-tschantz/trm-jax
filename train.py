@@ -42,7 +42,6 @@ class TrainConfig:
     ema_rate: float
     eval_every: int
     logit_lens_every: int
-    deterministic_eval: bool
     energy: Dict[str, Any] 
     model: Dict[str, Any]
     model_type: str = "transformer"
@@ -67,9 +66,8 @@ DEFAULT_CONFIG = TrainConfig(
     ema_rate=0.999,
     eval_every=1000,
     logit_lens_every=200,
-    deterministic_eval=True,
     model_type="trm",
-    energy=dict(lr=0.01),
+    energy=dict(lr=1.0),
     model=dict(
         halt_exploration_prob=0.1,
         halt_max_steps=16,
