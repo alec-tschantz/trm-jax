@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 
 from trm.model import Model
-from trm.nn import Linear
+from trm.nn import Linear, rms_norm
 
 
 @dataclass
@@ -32,11 +32,8 @@ class EnergyModel(Model):
         cos_sin,
     ) -> jnp.ndarray:
 
-        ctx = jax.lax.stop_gradient(context)
-        cs = jax.lax.stop_gradient(cos_sin)
-
         s_cast = state.astype(self.forward_dtype)
-        h = self.network(s_cast, ctx, cs).astype(self.forward_dtype)
+        h = self.network(s_cast, context, cos_sin).astype(self.forward_dtype)
 
         energy_map = self.energy_head(h).astype(jnp.float32)
         return jnp.mean(energy_map)
