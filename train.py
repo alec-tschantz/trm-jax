@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple
+from typing import Any, Dict, List
 
 import equinox as eqx
 import jax
@@ -14,12 +14,13 @@ import wandb
 import tyro
 
 from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
-from logit_lens import evaluate_logit_lens
+from evaluate import evaluate_model, evaluate_logit_lens
 from trm.losses import act_loss
 from trm.model import Carry, Model
 from trm.ebm import EnergyModel, EnergyConfig
 from trm.utils import EMAHelper
 from trm.optim import adam_atan2, sparse_sign_sgd
+
 
 
 @dataclass
@@ -44,9 +45,9 @@ class TrainConfig:
     logit_lens_every: int
     energy: Dict[str, Any] 
     model: Dict[str, Any]
-    model_type: str = "transformer"
+    model_type: str 
 
-
+    
 DEFAULT_CONFIG = TrainConfig(
     data_paths=["data/maze-30x30-hard-1k"],
     global_batch_size=96,
@@ -181,7 +182,7 @@ def cosine_schedule_with_warmup_lr_lambda(
     )
 
 
-def init_train_state(
+def create_train_state(
     config: TrainConfig,
     train_metadata: PuzzleDatasetMetadata,
 ):
@@ -251,111 +252,6 @@ def infinite_dataloader(dataloader: DataLoader):
             yield batch
 
 
-class EvalState(NamedTuple):
-    accuracy: jnp.ndarray
-    exact_accuracy: jnp.ndarray
-    q_halt_accuracy: jnp.ndarray
-    count: jnp.ndarray
-    lm_loss: jnp.ndarray
-
-
-def _zero_eval_state(dtype=jnp.float32) -> EvalState:
-    zero = jnp.array(0.0, dtype=dtype)
-    return EvalState(zero, zero, zero, zero, zero)
-
-
-@eqx.filter_jit
-def _eval_rollout(
-    model: Model,
-    carry: Carry,
-    rng: jnp.ndarray,
-    max_steps: int,
-) -> EvalState:
-    max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
-
-    def cond_fn(state):
-        _, _, _, steps, finished = state
-        return jnp.logical_and(steps < max_steps, jnp.logical_not(finished))
-
-    def body_fn(state):
-        carry, rng, agg, steps, finished = state
-        rng, step_rng = jax.random.split(rng)
-        carry, _loss, metrics, _, all_finish = act_loss(
-            model,
-            carry,
-            rng=step_rng,
-            return_keys=(),
-            training=False,
-        )
-        new_agg = EvalState(
-            accuracy=agg.accuracy + metrics["accuracy"],
-            exact_accuracy=agg.exact_accuracy + metrics["exact_accuracy"],
-            q_halt_accuracy=agg.q_halt_accuracy + metrics["q_halt_accuracy"],
-            count=agg.count + metrics["count"],
-            lm_loss=metrics["lm_loss"],
-        )
-        new_finished = jnp.logical_or(finished, all_finish)
-        return carry, rng, new_agg, steps + 1, new_finished
-
-    init_state = (
-        carry,
-        rng,
-        _zero_eval_state(),
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(False),
-    )
-
-    _, _, aggregates, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
-    return aggregates
-
-
-def evaluate_model(
-    model: Model,
-    dataloader: DataLoader,
-    *,
-    rng: jnp.ndarray | None = None,
-) -> Dict[str, float]:
-    eval_rng = rng if rng is not None else jax.random.PRNGKey(0)
-    totals = {
-        "lm_loss": 0.0,
-        "accuracy": 0.0,
-        "exact_accuracy": 0.0,
-        "q_halt_accuracy": 0.0,
-        "count": 0.0,
-        "loss_denominator": 0.0,
-    }
-    max_steps = getattr(model.config, "halt_max_steps", 1)
-
-    for _, batch, global_batch_size in dataloader:
-        batch_jnp = batch_to_jnp(batch)
-        carry = model.initial_carry(batch_jnp)
-        carry = filter_carry(model, carry, batch_jnp)
-        eval_rng, batch_rng = jax.random.split(eval_rng)
-        aggregates = _eval_rollout(
-            model,
-            carry,
-            batch_rng,
-            max_steps,
-        )
-        aggregates = jtu.tree_map(lambda x: float(x), aggregates)
-        totals["accuracy"] += aggregates.accuracy
-        totals["exact_accuracy"] += aggregates.exact_accuracy
-        totals["q_halt_accuracy"] += aggregates.q_halt_accuracy
-        totals["count"] += aggregates.count
-        totals["lm_loss"] += aggregates.lm_loss
-        totals["loss_denominator"] += float(global_batch_size)
-
-    results = {}
-    if totals["loss_denominator"] > 0:
-        results["test/lm_loss"] = totals["lm_loss"] / totals["loss_denominator"]
-    if totals["count"] > 0:
-        denom = max(totals["count"], 1e-8)
-        results["test/accuracy"] = totals["accuracy"] / denom
-        results["test/exact_accuracy"] = totals["exact_accuracy"] / denom
-        results["test/q_halt_accuracy"] = totals["q_halt_accuracy"] / denom
-    return results
-
-
 def train_loop(config: TrainConfig):
     torch.random.manual_seed(config.seed)
 
@@ -376,7 +272,7 @@ def train_loop(config: TrainConfig):
 
     test_loader_iter = infinite_dataloader(test_loader)
 
-    train_state, optimizer, param_labels = init_train_state(config, train_metadata)
+    train_state, optimizer, param_labels = create_train_state(config, train_metadata)
 
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
     wandb.init(
@@ -492,6 +388,8 @@ def train_loop(config: TrainConfig):
             eval_logs = evaluate_model(
                 eval_model,
                 test_loader,
+                batch_converter=batch_to_jnp,
+                prepare_carry_fn=filter_carry,
                 rng=eval_step_rng,
             )
             if eval_logs:
