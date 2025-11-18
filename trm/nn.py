@@ -227,9 +227,9 @@ class SwiGLU(eqx.Module):
         return self.down_proj(jax.nn.silu(gate) * up)
 
 
-def rms_norm(hidden_states: jnp.ndarray, variance_epsilon: float) -> jnp.ndarray:
+def rms_norm(hidden_states: jnp.ndarray, eps: float) -> jnp.ndarray:
     orig_dtype = hidden_states.dtype
     hidden_states = hidden_states.astype(jnp.float32)
     variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
-    hidden_states = hidden_states * jax.lax.rsqrt(variance + variance_epsilon)
+    hidden_states = hidden_states * jax.lax.rsqrt(variance + eps)
     return hidden_states.astype(orig_dtype)

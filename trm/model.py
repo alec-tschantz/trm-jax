@@ -83,10 +83,10 @@ class Block(eqx.Module):
         dtype = h.dtype
 
         attn_out = self.self_attn(cos_sin, h)
-        h2 = rms_norm(h + attn_out.astype(dtype), variance_epsilon=self.norm_eps)
+        h2 = rms_norm(h + attn_out.astype(dtype), eps=self.norm_eps)
 
         mlp_out = self.mlp(h2)
-        h3 = rms_norm(h2 + mlp_out.astype(dtype), variance_epsilon=self.norm_eps)
+        h3 = rms_norm(h2 + mlp_out.astype(dtype), eps=self.norm_eps)
 
         return h3
 
