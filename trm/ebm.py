@@ -10,8 +10,8 @@ from trm.nn import Linear, rms_norm
 
 @dataclass
 class EnergyConfig:
-    lr: float = 5.0
-    noise_scale: float = 3.0
+    lr: float = 1.0
+    noise_scale: float = 0.01
 
 
 class EnergyModel(Model):
@@ -36,7 +36,7 @@ class EnergyModel(Model):
         h = self.network(s_cast, context, cos_sin).astype(self.forward_dtype)
 
         energy_map = self.energy_head(h).astype(jnp.float32)
-        return jnp.mean(energy_map)
+        return jnp.sum(energy_map)
 
     def update_state(
         self,
