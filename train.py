@@ -11,11 +11,13 @@ import torch
 from torch.utils.data import DataLoader
 import tqdm
 import wandb
+import tyro
 
 from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from logit_lens import evaluate_logit_lens
 from trm.losses import act_loss
 from trm.model import Carry, Model
+from trm.ebm import EnergyModel, EnergyConfig
 from trm.utils import EMAHelper
 from trm.optim import adam_atan2, sparse_sign_sgd
 
@@ -31,8 +33,8 @@ class TrainConfig:
     weight_decay: float
     beta1: float
     beta2: float
-    puzzle_emb_lr: float
-    puzzle_emb_weight_decay: float
+    task_emb_lr: float
+    task_emb_weight_decay: float
     grad_clip_norm: float | None
     project_name: str
     run_name: str
@@ -41,12 +43,14 @@ class TrainConfig:
     eval_every: int
     logit_lens_every: int
     deterministic_eval: bool
+    energy: Dict[str, Any] 
     model: Dict[str, Any]
+    model_type: str = "transformer"
 
 
 DEFAULT_CONFIG = TrainConfig(
     data_paths=["data/maze-30x30-hard-1k"],
-    global_batch_size=192,
+    global_batch_size=96,
     epochs=50000,
     lr=1e-4,
     lr_min_ratio=1.0,
@@ -54,30 +58,30 @@ DEFAULT_CONFIG = TrainConfig(
     weight_decay=1.0,
     beta1=0.9,
     beta2=0.95,
-    puzzle_emb_lr=1e-4,
-    puzzle_emb_weight_decay=1.0,
+    task_emb_lr=1e-4,
+    task_emb_weight_decay=1.0,
     grad_clip_norm=1.0,
-    project_name="maze-act",
-    run_name="default",
+    project_name="energy-trm",
+    run_name="baseline",
     seed=0,
     ema_rate=0.999,
     eval_every=1000,
-    logit_lens_every=200,
+    logit_lens_every=10,
     deterministic_eval=True,
+    model_type="transformer",
+    energy=dict(lr=0.1),
     model=dict(
         halt_exploration_prob=0.1,
         halt_max_steps=16,
-        H_cycles=3,
-        L_cycles=4,
-        L_layers=2,
+        y_cycles=3,
+        z_cycles=4,
+        num_layers=2,
         hidden_size=512,
         num_heads=8,
         expansion=4,
-        puzzle_emb_ndim=512,
+        task_emb_ndim=512,
         forward_dtype="bfloat16",
-        puzzle_emb_len=16,
-        stochastic_z_h=False,
-        stochastic_z_l=True,
+        task_emb_len=16,
     ),
 )
 
@@ -122,16 +126,19 @@ def create_model(
         batch_size=config.global_batch_size,
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
-        num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
-        causal=False,
+        num_task_identifiers=train_metadata.num_puzzle_identifiers,
     )
     key = jax.random.PRNGKey(config.seed)
-    model = Model(model_cfg, key=key)
+    if config.model_type.lower() == "energy":
+        energy_cfg = EnergyConfig(**config.energy)
+        model = EnergyModel(model_cfg, energy_cfg, key=key)
+    else:
+        model = Model(model_cfg, key=key)
     params, static = eqx.partition(model, eqx.is_array)
 
     def build_param_labels(p):
         labels = jax.tree.map(lambda _: 0, p)
-        labels = eqx.tree_at(lambda tree: tree.inner.puzzle_emb.weight, labels, 1)
+        labels = eqx.tree_at(lambda tree: tree.task_embed.weight, labels, 1)
         return labels
 
     param_labels = build_param_labels(params)
@@ -142,7 +149,7 @@ def create_model(
             beta2=config.beta2,
             weight_decay=config.weight_decay,
         ),
-        1: sparse_sign_sgd(weight_decay=config.puzzle_emb_weight_decay),
+        1: sparse_sign_sgd(weight_decay=config.task_emb_weight_decay),
     }
 
     optimizer = optax.multi_transform(transforms, build_param_labels)
@@ -220,24 +227,30 @@ def batch_to_jnp(batch: Dict[str, torch.Tensor]) -> Dict[str, jnp.ndarray]:
     return {k: jnp.asarray(v.detach().cpu().numpy()) for k, v in batch.items()}
 
 
-def prepare_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> Carry:
-    new_inner_carry = model.inner.reset_carry(carry.halted, carry.inner_carry)
+def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> Carry:
+    new_states = model.reset_states(carry.halted, carry.states)
     new_steps = jnp.where(carry.halted, 0, carry.steps)
     halted = carry.halted
-    new_current_data = {
+    data = {
         k: jnp.where(
             halted.reshape((-1,) + (1,) * (batch[k].ndim - 1)),
             batch[k],
-            carry.current_data[k],
+            carry.data[k],
         )
         for k in batch
     }
     return Carry(
-        inner_carry=new_inner_carry,
+        states=new_states,
         steps=new_steps,
         halted=halted,
-        current_data=new_current_data,
+        data=data,
     )
+
+
+def infinite_dataloader(dataloader: DataLoader):
+    while True:
+        for batch in dataloader:
+            yield batch
 
 
 class EvalState(NamedTuple):
@@ -259,8 +272,6 @@ def _eval_rollout(
     carry: Carry,
     rng: jnp.ndarray,
     max_steps: int,
-    *,
-    sample_stochastic_states: bool,
 ) -> EvalState:
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
 
@@ -277,7 +288,6 @@ def _eval_rollout(
             rng=step_rng,
             return_keys=(),
             training=False,
-            sample_stochastic_states=sample_stochastic_states,
         )
         new_agg = EvalState(
             accuracy=agg.accuracy + metrics["accuracy"],
@@ -306,7 +316,6 @@ def evaluate_model(
     dataloader: DataLoader,
     *,
     rng: jnp.ndarray | None = None,
-    sample_stochastic_states: bool = False,
 ) -> Dict[str, float]:
     eval_rng = rng if rng is not None else jax.random.PRNGKey(0)
     totals = {
@@ -322,14 +331,13 @@ def evaluate_model(
     for _, batch, global_batch_size in dataloader:
         batch_jnp = batch_to_jnp(batch)
         carry = model.initial_carry(batch_jnp)
-        carry = prepare_carry(model, carry, batch_jnp)
+        carry = filter_carry(model, carry, batch_jnp)
         eval_rng, batch_rng = jax.random.split(eval_rng)
         aggregates = _eval_rollout(
             model,
             carry,
             batch_rng,
             max_steps,
-            sample_stochastic_states=sample_stochastic_states,
         )
         aggregates = jtu.tree_map(lambda x: float(x), aggregates)
         totals["accuracy"] += aggregates.accuracy
@@ -368,16 +376,7 @@ def train_loop(config: TrainConfig):
         global_batch_size=config.global_batch_size,
     )
 
-    test_loader_iter = iter(test_loader)
-
-    def sample_test_batch():
-        nonlocal test_loader_iter
-        try:
-            _, batch, _ = next(test_loader_iter)
-        except StopIteration:
-            test_loader_iter = iter(test_loader)
-            _, batch, _ = next(test_loader_iter)
-        return batch
+    test_loader_iter = infinite_dataloader(test_loader)
 
     train_state, optimizer, param_labels = init_train_state(config, train_metadata)
 
@@ -405,19 +404,18 @@ def train_loop(config: TrainConfig):
     clipper_state = optax.EmptyState() if clipper is not None else None
 
     @eqx.filter_jit
-    def train_step(params, opt_state, carry, batch, rng, lr_main, lr_puzzle):
+    def train_step(params, opt_state, carry, batch, rng, lr_main, lr_task):
         gb = jnp.asarray(batch["global_batch_size"], dtype=jnp.float32)
 
         def loss_fn(p):
             model = eqx.combine(p, static_model)
-            prepared_carry = prepare_carry(model, carry, batch["data"])
+            prepared_carry = filter_carry(model, carry, batch["data"])
             new_carry, loss, metrics, _, _ = act_loss(
                 model,
                 prepared_carry,
                 rng=rng,
                 return_keys=(),
                 training=True,
-                sample_stochastic_states=True,
             )
             return loss / gb, (new_carry, metrics, loss)
 
@@ -433,7 +431,7 @@ def train_loop(config: TrainConfig):
         def scale_update(update, label):
             if update is None:
                 return None
-            lr = jnp.where(jnp.equal(label, 1), lr_puzzle, lr_main)
+            lr = jnp.where(jnp.equal(label, 1), lr_task, lr_main)
             return update * lr
 
         updates = jax.tree.map(scale_update, updates, param_labels)
@@ -450,7 +448,7 @@ def train_loop(config: TrainConfig):
             train_state.carry = model.initial_carry(batch_jnp)
 
         lr_main = compute_lr(config.lr, config, train_state)
-        lr_puzzle = compute_lr(config.puzzle_emb_lr, config, train_state)
+        lr_task = compute_lr(config.task_emb_lr, config, train_state)
         rng, step_rng = jax.random.split(train_state.rng)
         batch_pack = {
             "data": batch_jnp,
@@ -469,7 +467,7 @@ def train_loop(config: TrainConfig):
             batch_pack,
             step_rng,
             lr_main,
-            lr_puzzle,
+            lr_task,
         )
         train_state.params = new_params
         train_state.step += 1
@@ -486,7 +484,7 @@ def train_loop(config: TrainConfig):
                 for k in metric_values
             }
             logged["train/lr"] = float(lr_main)
-            logged["train/puzzle_lr"] = float(lr_puzzle)
+            logged["train/task_lr"] = float(lr_task)
             wandb.log(logged, step=train_state.step)
             progress_bar.update(train_state.step - progress_bar.n)
 
@@ -497,7 +495,6 @@ def train_loop(config: TrainConfig):
                 eval_model,
                 test_loader,
                 rng=eval_step_rng,
-                sample_stochastic_states=not config.deterministic_eval,
             )
             if eval_logs:
                 wandb.log(eval_logs, step=train_state.step)
@@ -506,20 +503,24 @@ def train_loop(config: TrainConfig):
             and train_state.step % config.logit_lens_every == 0
         ):
             lens_model = ema_helper.ema_copy()
-            test_batch = batch_to_jnp(sample_test_batch())
+            _, sampled_batch, _ = next(test_loader_iter)
+            test_batch = batch_to_jnp(sampled_batch)
             logit_lens_rng, lens_step_rng = jax.random.split(logit_lens_rng)
             evaluate_logit_lens(
                 lens_model,
                 test_batch,
                 test_metadata,
-                prepare_carry_fn=prepare_carry,
+                filter_carry_fn=filter_carry,
                 step=train_state.step,
                 rng=lens_step_rng,
-                sample_stochastic_states=True,
             )
 
     wandb.finish()
 
 
+def main(config: TrainConfig = DEFAULT_CONFIG):
+    train_loop(config)
+
+
 if __name__ == "__main__":
-    train_loop(DEFAULT_CONFIG)
+    tyro.cli(main)()

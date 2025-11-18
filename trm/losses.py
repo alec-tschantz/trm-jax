@@ -25,36 +25,18 @@ def stablemax_cross_entropy(
     return -jnp.where(valid_mask, prediction_logprobs, 0.0)
 
 
-def act_loss(
-    model: Model,
+def compute_act_metrics(
+    labels: jnp.ndarray,
+    preds: jnp.ndarray,
+    q_halt_logits: jnp.ndarray,
     carry: Carry,
-    rng: jnp.ndarray,
-    return_keys: Sequence[str],
-    *,
-    training: bool,
-    sample_stochastic_states: bool,
-) -> Tuple[
-    Carry, jnp.ndarray, Dict[str, jnp.ndarray], Dict[str, jnp.ndarray], jnp.ndarray
-]:
-    new_carry, outputs = model(
-        carry,
-        rng=rng,
-        training=training,
-        sample_stochastic_states=sample_stochastic_states,
-    )
-    labels = new_carry.current_data["labels"]
-    logits = outputs["logits"]
-    q_halt_logits = outputs["q_halt_logits"]
-    preds = jnp.argmax(logits, axis=-1)
-    outputs = dict(outputs)
-    outputs["preds"] = preds
-
+) -> tuple[Dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     mask = labels != IGNORE_LABEL_ID
     loss_counts = jnp.sum(mask, axis=-1)
     loss_divisor = jnp.maximum(loss_counts, 1)[..., None]
     is_correct = jnp.logical_and(preds == labels, mask)
     seq_is_correct = jnp.sum(is_correct, axis=-1) == loss_counts
-    valid_metrics = jnp.logical_and(new_carry.halted, loss_counts > 0)
+    valid_metrics = jnp.logical_and(carry.halted, loss_counts > 0)
 
     def reduce_metric(values):
         return jnp.sum(jnp.where(valid_metrics, values, 0.0))
@@ -68,8 +50,39 @@ def act_loss(
         "q_halt_accuracy": reduce_metric(
             (jnp.where(q_halt_logits >= 0, 1, 0) == seq_is_correct).astype(jnp.float32)
         ),
-        "steps": reduce_metric(new_carry.steps.astype(jnp.float32)),
+        "steps": reduce_metric(carry.steps.astype(jnp.float32)),
     }
+    return metrics, mask, seq_is_correct, loss_divisor
+
+
+def act_loss(
+    model: Model,
+    carry: Carry,
+    rng: jnp.ndarray,
+    return_keys: Sequence[str],
+    *,
+    training: bool,
+) -> Tuple[
+    Carry, jnp.ndarray, Dict[str, jnp.ndarray], Dict[str, jnp.ndarray], jnp.ndarray
+]:
+    new_carry, outputs = model(
+        carry,
+        rng=rng,
+        training=training,
+    )
+    labels = new_carry.data["labels"]
+    logits = outputs["logits"]
+    q_halt_logits = outputs["q_halt_logits"]
+    preds = jnp.argmax(logits, axis=-1)
+    outputs = dict(outputs)
+    outputs["preds"] = preds
+
+    metrics, mask, seq_is_correct, loss_divisor = compute_act_metrics(
+        labels,
+        preds,
+        q_halt_logits,
+        new_carry,
+    )
 
     lm_loss = jnp.sum(
         stablemax_cross_entropy(logits, labels, valid_mask=mask) / loss_divisor

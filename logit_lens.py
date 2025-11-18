@@ -9,17 +9,23 @@ from PIL import Image, ImageDraw, ImageFont
 import wandb
 
 from dataset import PuzzleDatasetMetadata
-from trm.model import Carry, InnerCarry, Model
+from trm.model import Carry, Model
 
 
-LOGIT_LENS_CHARSET = "# SGo"
-LOGIT_LENS_COLOR_MAP = {
-    "#": (25, 25, 25),
-    " ": (242, 242, 242),
-    "S": (52, 168, 83),
-    "G": (234, 67, 53),
-    "o": (30, 136, 229),
-}
+LOGIT_LENS_COLORS = [
+    (25, 25, 25),
+    (242, 242, 242),
+    (52, 168, 83),
+    (234, 67, 53),
+    (30, 136, 229),
+    (249, 168, 37),
+    (171, 71, 188),
+    (0, 172, 193),
+    (255, 109, 132),
+    (123, 31, 162),
+    (255, 214, 0),
+    (0, 137, 123),
+]
 LOGIT_LENS_PANEL_SIZE = 256
 LOGIT_LENS_TITLE_HEIGHT = 24
 LOGIT_LENS_BANNER_HEIGHT = 28
@@ -29,27 +35,22 @@ LOGIT_LENS_TEXT_COLOR = (0, 0, 0)
 LOGIT_LENS_FONT = ImageFont.load_default()
 
 
-def _build_logit_lens_palette(vocab_size: int) -> np.ndarray:
-    palette = np.zeros((vocab_size, 3), dtype=np.uint8)
-    palette[0] = np.array([120, 120, 120], dtype=np.uint8)
-    for idx, token in enumerate(LOGIT_LENS_CHARSET, start=1):
-        palette[idx] = np.array(
-            LOGIT_LENS_COLOR_MAP.get(token, (200, 200, 200)), dtype=np.uint8
-        )
-    return palette
+def _build_logit_lens_palette() -> np.ndarray:
+    return np.asarray(LOGIT_LENS_COLORS, dtype=np.uint8)
 
 
 def _tokens_to_color_grid(tokens: np.ndarray, palette: np.ndarray, grid_size: int):
     flat = tokens.reshape(grid_size, grid_size)
-    colors = palette[np.clip(flat, 0, palette.shape[0] - 1)]
+    indices = np.mod(flat, palette.shape[0])
+    colors = palette[np.clip(indices, 0, palette.shape[0] - 1)]
     return colors.astype(np.uint8)
 
 
 def _hidden_to_tokens(
-    hidden_states: jnp.ndarray, lm_head, puzzle_emb_len: int
+    hidden_states: jnp.ndarray, lm_head, task_emb_len: int
 ) -> jnp.ndarray:
     logits = lm_head(hidden_states).astype(jnp.float32)
-    logits = logits[..., puzzle_emb_len:, :]
+    logits = logits[..., task_emb_len:, :]
     return jnp.argmax(logits, axis=-1)
 
 
@@ -98,6 +99,38 @@ def _frame_from_panels(
     return frame
 
 
+def _grid_from_panels(
+    top_left: Image.Image,
+    top_right: Image.Image,
+    bottom_left: Image.Image,
+    bottom_right: Image.Image,
+    banner: Optional[str],
+) -> Image.Image:
+    row_width = top_left.width + top_right.width
+    row_height = top_left.height
+    total_height = LOGIT_LENS_BANNER_HEIGHT + row_height * 2
+    frame = Image.new("RGB", (row_width, total_height), LOGIT_LENS_TITLE_BG)
+
+    frame.paste(top_left, (0, LOGIT_LENS_BANNER_HEIGHT))
+    frame.paste(top_right, (top_left.width, LOGIT_LENS_BANNER_HEIGHT))
+    frame.paste(bottom_left, (0, LOGIT_LENS_BANNER_HEIGHT + row_height))
+    frame.paste(
+        bottom_right,
+        (top_left.width, LOGIT_LENS_BANNER_HEIGHT + row_height),
+    )
+
+    if banner:
+        draw = ImageDraw.Draw(frame)
+        draw.text(
+            (row_width // 2, LOGIT_LENS_BANNER_HEIGHT // 2),
+            banner,
+            font=LOGIT_LENS_FONT,
+            fill=LOGIT_LENS_TEXT_COLOR,
+            anchor="mm",
+        )
+    return frame
+
+
 def _pil_to_chw(image: Image.Image) -> np.ndarray:
     arr = np.asarray(image, dtype=np.uint8)
     return np.transpose(arr, (2, 0, 1))
@@ -110,160 +143,90 @@ def _safe_tokens(arr: np.ndarray) -> np.ndarray:
 
 
 def _render_logit_lens_frames(
-    zh_tokens: np.ndarray,
-    zl_tokens: np.ndarray,
+    y_tokens: np.ndarray,
+    z_tokens: np.ndarray,
     sample_inputs: np.ndarray,
-    sample_labels: np.ndarray | None,
+    sample_outputs: np.ndarray | None,
     palette: np.ndarray,
     grid_size: int,
 ) -> np.ndarray:
     frames: List[np.ndarray] = []
 
-    intro_right_tokens = (
-        _safe_tokens(sample_labels)
-        if sample_labels is not None
+    num_iters = y_tokens.shape[0]
+    z_cycles = z_tokens.shape[1] if z_tokens.ndim >= 2 else 0
+    input_panel = _render_panel(
+        _safe_tokens(sample_inputs), palette, grid_size, "Input"
+    )
+    output_tokens = (
+        _safe_tokens(sample_outputs)
+        if sample_outputs is not None
         else _safe_tokens(sample_inputs)
     )
-    intro_left = _render_panel(_safe_tokens(sample_inputs), palette, grid_size, "Input")
-    intro_right = _render_panel(
-        intro_right_tokens,
-        palette,
-        grid_size,
-        "Label" if sample_labels is not None else "Input",
-    )
-    intro_frame = _frame_from_panels(intro_left, intro_right, banner=None)
-    frames.append(_pil_to_chw(intro_frame))
+    output_title = "Output" if sample_outputs is not None else "Input"
+    output_panel = _render_panel(output_tokens, palette, grid_size, output_title)
+    blank_tokens = np.zeros_like(sample_inputs)
 
-    steps, h_cycles = zh_tokens.shape[:2]
-    l_cycles = zl_tokens.shape[2] if zl_tokens.ndim >= 3 else 0
+    for iter_idx in range(num_iters):
+        y_panel = _render_panel(
+            _safe_tokens(y_tokens[iter_idx]),
+            palette,
+            grid_size,
+            f"y={iter_idx}",
+        )
+        if z_cycles == 0:
+            z_panel = _render_panel(blank_tokens, palette, grid_size, "z")
+            frame = _grid_from_panels(
+                y_panel,
+                z_panel,
+                input_panel,
+                output_panel,
+                banner=f"iter={iter_idx}",
+            )
+            frames.append(_pil_to_chw(frame))
+            continue
 
-    for step_idx in range(steps):
-        for h_idx in range(h_cycles):
-            zh_panel = _render_panel(
-                _safe_tokens(zh_tokens[step_idx, h_idx]),
+        for z_idx in range(z_cycles):
+            z_panel = _render_panel(
+                _safe_tokens(z_tokens[iter_idx, z_idx]),
                 palette,
                 grid_size,
-                f"ZH={h_idx}",
+                f"z={z_idx}",
             )
-            for l_idx in range(l_cycles):
-                zl_panel = _render_panel(
-                    _safe_tokens(zl_tokens[step_idx, h_idx, l_idx]),
-                    palette,
-                    grid_size,
-                    f"ZL={l_idx}",
-                )
-                combined = _frame_from_panels(
-                    zh_panel, zl_panel, banner=f"R={step_idx}"
-                )
-                frames.append(_pil_to_chw(combined))
+            frame = _grid_from_panels(
+                y_panel,
+                z_panel,
+                input_panel,
+                output_panel,
+                banner=f"iter={iter_idx}",
+            )
+            frames.append(_pil_to_chw(frame))
 
     return np.stack(frames, axis=0).astype(np.uint8)
 
 
-def _inner_forward_with_states(
-    model: Model,
-    carry: InnerCarry,
-    batch: Dict[str, jnp.ndarray],
-    rng: jnp.ndarray,
-    *,
-    sample_stochastic_states: bool,
-) -> tuple[InnerCarry, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    inner = model.inner
-    cos_sin = inner.rotary_emb()
-    inp = inner._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
-    z_H, z_L = carry.z_H, carry.z_L
-
-    z_H_traces = []
-    z_L_traces = []
-
-    for _ in range(inner.config.H_cycles):
-        inj = (z_H + inp).astype(inner.forward_dtype)
-
-        l_cycle_states = []
-        for _ in range(inner.config.L_cycles):
-            z_L = inner.L_level(z_L, inj, cos_sin).astype(inner.forward_dtype)
-            step_rng = rng
-            if (
-                inner.z_L_stochastic_head is not None
-                and sample_stochastic_states
-            ):
-                rng, step_rng = jax.random.split(rng)
-            z_L = inner._maybe_sample_state(
-                inner.z_L_stochastic_head, z_L, step_rng, sample_stochastic_states
-            )
-            l_cycle_states.append(jax.lax.stop_gradient(z_L))
-
-        z_H = inner.L_level(z_H, z_L, cos_sin).astype(inner.forward_dtype)
-        step_rng = rng
-        if inner.z_H_stochastic_head is not None and sample_stochastic_states:
-            rng, step_rng = jax.random.split(rng)
-        z_H = inner._maybe_sample_state(
-            inner.z_H_stochastic_head, z_H, step_rng, sample_stochastic_states
-        )
-        z_H = jax.lax.stop_gradient(z_H)
-        z_L = jax.lax.stop_gradient(z_L)
-
-        z_H_traces.append(z_H)
-        z_L_traces.append(jnp.stack(l_cycle_states))
-
-    new_carry = InnerCarry(z_H=z_H, z_L=z_L)
-    return (
-        new_carry,
-        jnp.stack(z_H_traces),
-        jnp.stack(z_L_traces),
-        rng,
-    )
-
-
 @eqx.filter_jit
-def forward_with_logits(
+def _collect_state_histories(
     model: Model,
     carry: Carry,
-    *,
-    max_steps: int | None = None,
     rng: jnp.ndarray,
-    sample_stochastic_states: bool = True,
 ) -> tuple[Carry, jnp.ndarray, jnp.ndarray]:
-    steps_to_run = model.config.halt_max_steps if max_steps is None else int(max_steps)
-    inner_carry = carry.inner_carry
-    current_data = carry.current_data
-    steps = carry.steps
-    halted = carry.halted
-
-    zh_states = []
-    zl_states = []
-
-    for _ in range(steps_to_run):
-        inner_carry, zh_cycle, zl_cycle, rng = _inner_forward_with_states(
-            model,
-            inner_carry,
-            current_data,
-            rng,
-            sample_stochastic_states=sample_stochastic_states,
-        )
-        zh_states.append(zh_cycle)
-        zl_states.append(zl_cycle)
-        steps = steps + 1
-        halted = jnp.logical_or(halted, steps >= model.config.halt_max_steps)
-
-    new_carry = Carry(
-        inner_carry=inner_carry,
-        steps=steps,
-        halted=halted,
-        current_data=current_data,
+    new_carry, outputs = model(
+        carry,
+        rng=rng,
+        training=False,
+        record=True,
     )
-    return new_carry, jnp.stack(zh_states), jnp.stack(zl_states)
+    return new_carry, outputs["y_states"], outputs["z_states"]
 
 
 def evaluate_logit_lens(
     model: Model,
     batch: Dict[str, jnp.ndarray],
     metadata: PuzzleDatasetMetadata,
-    prepare_carry_fn,
+    filter_carry_fn,
     *,
     step: int,
     rng: jnp.ndarray,
-    sample_stochastic_states: bool = True,
 ):
     if batch["inputs"].shape[0] == 0:
         return
@@ -274,36 +237,28 @@ def evaluate_logit_lens(
         if k in ("inputs", "labels", "puzzle_identifiers")
     }
     carry = model.initial_carry(single)
-    carry = prepare_carry_fn(model, carry, single)
-    _, zh_hidden, zl_hidden = forward_with_logits(
-        model,
-        carry,
-        rng=rng,
-        sample_stochastic_states=sample_stochastic_states,
-    )
+    carry = filter_carry_fn(model, carry, single)
+    _, y_hidden, z_hidden = _collect_state_histories(model, carry, rng)
 
-    palette = _build_logit_lens_palette(metadata.vocab_size)
+    palette = _build_logit_lens_palette()
     grid_size = int(round(math.sqrt(metadata.seq_len)))
-    if grid_size * grid_size != metadata.seq_len:
-        return
 
-    zh_tokens = _hidden_to_tokens(
-        zh_hidden, model.inner.lm_head, model.inner.puzzle_emb_len
-    )
-    zl_tokens = _hidden_to_tokens(
-        zl_hidden, model.inner.lm_head, model.inner.puzzle_emb_len
-    )
+    y_tokens = _hidden_to_tokens(y_hidden, model.lm_head, model.task_emb_len)
+    z_tokens = _hidden_to_tokens(z_hidden, model.lm_head, model.task_emb_len)
 
-    zh_tokens_np = np.asarray(jax.device_get(zh_tokens))[:, :, 0, :]
-    zl_tokens_np = np.asarray(jax.device_get(zl_tokens))[:, :, :, 0, :]
+    y_tokens_np = np.asarray(jax.device_get(y_tokens))[:, 0, :]
+    z_tokens_np = np.asarray(jax.device_get(z_tokens))
+    z_tokens_np = z_tokens_np[:, :, 0, :]
+   
+        
     sample_inputs = np.asarray(jax.device_get(single["inputs"][0]))
     sample_labels = (
         np.asarray(jax.device_get(single["labels"][0])) if "labels" in single else None
     )
 
     frames = _render_logit_lens_frames(
-        zh_tokens_np,
-        zl_tokens_np,
+        y_tokens_np,
+        z_tokens_np,
         sample_inputs,
         sample_labels,
         palette,
