@@ -59,7 +59,6 @@ def act_loss(
     model: Model,
     carry: Carry,
     rng: jnp.ndarray,
-    return_keys: Sequence[str],
     *,
     training: bool,
 ) -> Tuple[
@@ -69,6 +68,7 @@ def act_loss(
         carry,
         rng=rng,
         training=training,
+        record=False,
     )
     labels = new_carry.data["labels"]
     logits = outputs["logits"]
@@ -98,7 +98,7 @@ def act_loss(
         }
     )
 
-    detached_outputs = {k: outputs[k] for k in return_keys if k in outputs}
+    detached_outputs = {k: outputs[k] for k in outputs}
     total_loss = lm_loss + 0.5 * q_halt_loss
     all_finish = jnp.all(new_carry.halted)
     return new_carry, total_loss, metrics, detached_outputs, all_finish

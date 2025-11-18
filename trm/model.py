@@ -176,12 +176,15 @@ class Model(eqx.Module):
         cos_sin = self.rotary_emb()
         embeddings = self.embed(batch["inputs"], batch["puzzle_identifiers"])
 
+        state_rng, rng = jax.random.split(rng)
+
         y, z, y_hist, z_hist = self.inference(
             carry.states.y,
             carry.states.z,
             embeddings,
             cos_sin,
             record=record,
+            key=state_rng,
         )
 
         logits = self.lm_head(y).astype(jnp.float32)[:, self.task_emb_len :, :]
@@ -203,6 +206,15 @@ class Model(eqx.Module):
             "z_states": z_hist,
         }
 
+    def update_state(
+        self,
+        state: jnp.ndarray,
+        context: jnp.ndarray,
+        cos_sin: CosSin,
+        key: jnp.ndarray,
+    ) -> jnp.ndarray:
+        return self.network(state, context, cos_sin).astype(self.forward_dtype)
+
     def inference(
         self,
         y: jnp.ndarray,
@@ -211,6 +223,7 @@ class Model(eqx.Module):
         cos_sin: CosSin,
         *,
         record: bool = False,
+        key: jnp.ndarray,
     ):
         y_state = y.astype(self.forward_dtype)
         z_state = z.astype(self.forward_dtype)
@@ -219,9 +232,14 @@ class Model(eqx.Module):
 
         for idx in range(self.config.y_cycles):
             x_inj = (y_state + embeddings).astype(self.forward_dtype)
-            z_state, z_hist = self._run_z_cycles(z_state, x_inj, cos_sin, record=record)
+            key, z_rng = jax.random.split(key)
 
-            y_state = self.update_state(y_state, z_state, cos_sin)
+            z_state, z_hist = self._run_z_cycles(
+                z_state, x_inj, cos_sin, record=record, key=z_rng
+            )
+
+            key, y_rng = jax.random.split(key)
+            y_state = self.update_state(y_state, z_state, cos_sin, key=y_rng)
 
             if record:
                 y_records.append(jax.lax.stop_gradient(y_state))
@@ -235,14 +253,6 @@ class Model(eqx.Module):
         z_records = jnp.stack(z_records) if record else None
         return y_state, z_state, y_records, z_records
 
-    def update_state(
-        self,
-        state: jnp.ndarray,
-        context: jnp.ndarray,
-        cos_sin: CosSin,
-    ) -> jnp.ndarray:
-        return self.network(state, context, cos_sin).astype(self.forward_dtype)
-
     def _run_z_cycles(
         self,
         z_state: jnp.ndarray,
@@ -250,17 +260,17 @@ class Model(eqx.Module):
         cos_sin: CosSin,
         *,
         record: bool,
+        key: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        keys = jax.random.split(key, self.config.z_cycles)
 
-        def body(z_curr, _):
-            z_next = self.update_state(z_curr, x_inj, cos_sin)
+        def body(z_curr, rng):
+            z_next = self.update_state(z_curr, x_inj, cos_sin, key=rng)
             hist = jax.lax.stop_gradient(z_next) if record else None
             return z_next, hist
 
         body = eqx.filter_checkpoint(body)
-        z_final, z_hist = jax.lax.scan(
-            body, z_state, xs=None, length=self.config.z_cycles
-        )
+        z_final, z_hist = jax.lax.scan(body, z_state, keys)
         return z_final, z_hist
 
     def _update_halt_state(

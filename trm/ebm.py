@@ -11,6 +11,7 @@ from trm.nn import Linear
 @dataclass
 class EnergyConfig:
     lr: float = 0.1
+    noise_std: float = 1e-2
 
 
 class EnergyModel(Model):
@@ -24,7 +25,13 @@ class EnergyModel(Model):
         super().__init__(model_cfg, key=base_key)
         self.energy_head = Linear(self.config.hidden_size, 1, bias=True, key=head_key)
 
-    def update_state(self, state, context, cos_sin):
+    def update_state(
+        self,
+        state: jnp.ndarray,
+        context: jnp.ndarray,
+        cos_sin,
+        key: jnp.ndarray,
+    ):
         def energy_batch(s):
             h = self.network(s, context, cos_sin).astype(self.forward_dtype)
             energy_map = self.energy_head(h).astype(jnp.float32)
@@ -32,5 +39,9 @@ class EnergyModel(Model):
 
         grad = jax.grad(energy_batch)(state)
         step = jnp.asarray(self.energy_cfg.lr, dtype=grad.dtype)
-        updated = (state - step * grad).astype(self.forward_dtype)
+        noise = (
+            jax.random.normal(key, state.shape).astype(grad.dtype)
+            * self.energy_cfg.noise_std
+        )
+        updated = (state - step * grad + noise).astype(self.forward_dtype)
         return updated

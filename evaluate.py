@@ -70,7 +70,6 @@ def _eval_rollout(
             model,
             carry,
             rng=step_rng,
-            return_keys=(),
             training=False,
         )
         new_agg = EvalState(

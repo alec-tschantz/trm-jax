@@ -47,7 +47,7 @@ class TrainConfig:
     model: Dict[str, Any]
     model_type: str 
 
-    
+
 DEFAULT_CONFIG = TrainConfig(
     data_paths=["data/maze-30x30-hard-1k"],
     global_batch_size=96,
@@ -308,7 +308,6 @@ def train_loop(config: TrainConfig):
                 model,
                 prepared_carry,
                 rng=rng,
-                return_keys=(),
                 training=True,
             )
             return loss / gb, (new_carry, metrics, loss)
