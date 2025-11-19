@@ -76,7 +76,6 @@ DEFAULT_CONFIG = TrainConfig(
         task_emb_ndim=512,
         forward_dtype="bfloat16",
         task_emb_len=16,
-        z_vocab_size=32,
         energy_step_size=1.0,
         energy_noise_scale=0.0,
     ),

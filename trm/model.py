@@ -43,9 +43,8 @@ class ModelConfig(BaseModel):
 
     forward_dtype: str = "bfloat16"
     task_emb_len: int = 16
-    z_vocab_size: int = 32
-    energy_step_size: float = 1.0
-    energy_noise_scale: float = 0.0
+    energy_step_size: float = 0.01
+    energy_noise_scale: float = 0.01
 
 
 class State(eqx.Module):
@@ -111,7 +110,6 @@ class Model(eqx.Module):
     task_emb_len: int = eqx.field(static=True)
 
     embed_tokens: Embedding
-    z_embed: Embedding
     q_head: Linear
     energy_head: Linear
     task_embed: SparseEmbedding
@@ -128,7 +126,7 @@ class Model(eqx.Module):
         self.task_emb_len = config.task_emb_len
         embed_init_std = 1.0 / self.embed_scale
 
-        k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
 
         self.embed_tokens = Embedding(
             config.vocab_size,
@@ -138,15 +136,7 @@ class Model(eqx.Module):
             cast_to=dtype,
         )
 
-        self.z_embed = Embedding(
-            config.z_vocab_size,
-            config.hidden_size,
-            init_std=embed_init_std,
-            key=k2,
-            cast_to=dtype,
-        )
-
-        q_head = Linear(config.hidden_size, 1, bias=True, key=k3)
+        q_head = Linear(config.hidden_size, 1, bias=True, key=k2)
         q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
         bias_val = jnp.full_like(q_head.bias, -5.0)
         q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
@@ -157,10 +147,10 @@ class Model(eqx.Module):
             config.task_emb_ndim,
             init_std=0.0,
             cast_to=dtype,
-            key=k4,
+            key=k3,
         )
 
-        self.energy_head = Linear(config.hidden_size, 1, bias=True, key=k5)
+        self.energy_head = Linear(config.hidden_size, 1, bias=True, key=k4)
 
         self.rotary_emb = RotaryEmbedding(
             dim=config.hidden_size // config.num_heads,
@@ -168,7 +158,7 @@ class Model(eqx.Module):
             base=config.rope_theta,
         )
 
-        layer_keys = jax.random.split(k6, config.num_layers)
+        layer_keys = jax.random.split(k5, config.num_layers)
         self.network = Transformer(tuple(Block(config, key=kk) for kk in layer_keys))
 
     def __call__(
@@ -296,7 +286,7 @@ class Model(eqx.Module):
                 key=z_rng,
             )
 
-            z_embed = self._logits_to_embeddings(z_state, self.z_embed.weight)
+            z_embed = self._logits_to_embeddings(z_state, self.embed_tokens.weight)
             key, y_rng = jax.random.split(key)
             y_state = self.update_state(
                 y_state,
@@ -335,7 +325,7 @@ class Model(eqx.Module):
                 context,
                 cos_sin,
                 key=rng,
-                weight=self.z_embed.weight,
+                weight=self.embed_tokens.weight,
             )
             hist = jax.lax.stop_gradient(z_next) if record else None
             return z_next, hist
@@ -380,7 +370,7 @@ class Model(eqx.Module):
             (batch_size, total_len, self.config.vocab_size), dtype=self.forward_dtype
         )
         z_zeros = jnp.zeros(
-            (batch_size, total_len, self.config.z_vocab_size), dtype=self.forward_dtype
+            (batch_size, total_len, self.config.vocab_size), dtype=self.forward_dtype
         )
         return State(y=y_zeros, z=z_zeros)
 
