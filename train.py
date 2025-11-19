@@ -15,8 +15,7 @@ import tyro
 
 from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from evaluate import evaluate_model, evaluate_logit_lens
-from trm.losses import act_loss
-from trm.model import Carry, Model
+from trm.model import Model
 from trm.utils import EMAHelper
 from trm.optim import adam_atan2
 
@@ -40,6 +39,8 @@ class TrainConfig:
     ema_rate: float
     eval_every: int
     logit_lens_every: int
+    min_outer_steps: int
+    max_outer_steps: int
     model: Dict[str, Any]
 
 
@@ -60,9 +61,9 @@ DEFAULT_CONFIG = TrainConfig(
     ema_rate=0.999,
     eval_every=1000,
     logit_lens_every=200,
+    min_outer_steps=6,
+    max_outer_steps=20,
     model=dict(
-        halt_exploration_prob=0.1,
-        halt_max_steps=16,
         y_cycles=3,
         z_cycles=4,
         num_layers=2,
@@ -71,8 +72,10 @@ DEFAULT_CONFIG = TrainConfig(
         expansion=4,
         z_vocab_size=64,
         forward_dtype="bfloat16",
-        energy_step_size=0.1,
+        energy_step_size_min=0.05,
+        energy_step_size_max=0.15,
         energy_noise_scale=0.1,
+        max_outer_steps=20,
     ),
 )
 
@@ -82,7 +85,6 @@ class TrainState:
     params: eqx.Module
     static: eqx.Module
     opt_state: optax.OptState
-    carry: Carry | None
     step: int
     total_steps: int
     rng: jnp.ndarray
@@ -174,7 +176,6 @@ def create_train_state(
             params=params,
             static=static,
             opt_state=opt_state,
-            carry=None,
             step=0,
             total_steps=total_steps,
             rng=rng,
@@ -198,23 +199,22 @@ def batch_to_jnp(batch: Dict[str, torch.Tensor]) -> Dict[str, jnp.ndarray]:
     return {k: jnp.asarray(v.detach().cpu().numpy()) for k, v in batch.items()}
 
 
-def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> Carry:
-    new_states = model.reset_states(carry.halted, carry.states)
-    new_steps = jnp.where(carry.halted, 0, carry.steps)
-    halted = carry.halted
-    data = {
-        k: jnp.where(
-            halted.reshape((-1,) + (1,) * (batch[k].ndim - 1)),
-            batch[k],
-            carry.data[k],
-        )
-        for k in batch
-    }
-    return Carry(
-        states=new_states,
-        steps=new_steps,
-        halted=halted,
-        data=data,
+def compute_outer_steps(config: TrainConfig, train_state: TrainState) -> int:
+    if train_state.total_steps <= 1:
+        return config.max_outer_steps
+    progress = min(train_state.step / float(train_state.total_steps - 1), 1.0)
+    span = config.max_outer_steps - config.min_outer_steps
+    return int(round(config.min_outer_steps + progress * span))
+
+
+def sample_step_size(rng: jnp.ndarray, model_config) -> jnp.ndarray:
+    cfg = model_config
+    return jax.random.uniform(
+        rng,
+        (),
+        minval=cfg.energy_step_size_min,
+        maxval=cfg.energy_step_size_max,
+        dtype=jnp.float32,
     )
 
 
@@ -270,23 +270,24 @@ def train_loop(config: TrainConfig):
     clipper_state = optax.EmptyState() if clipper is not None else None
 
     @eqx.filter_jit
-    def train_step(params, opt_state, carry, batch, rng, lr_main):
-        gb = jnp.asarray(batch["global_batch_size"], dtype=jnp.float32)
+    def train_step(params, opt_state, batch, rng, lr_main, num_outer_steps, step_size):
+        rollout_steps = jnp.asarray(num_outer_steps, dtype=jnp.int32)
 
-        def loss_fn(p):
+        def loss_fn(p, key):
             model = eqx.combine(p, static_model)
-            prepared_carry = filter_carry(model, carry, batch["data"])
-            new_carry, loss, metrics, _, _ = act_loss(
-                model,
-                prepared_carry,
-                rng=rng,
+            loss, metrics = model.loss(
+                batch["inputs"],
+                batch["labels"],
+                rng=key,
+                num_outer_steps=rollout_steps,
+                step_size=step_size,
                 training=True,
             )
-            return loss / gb, (new_carry, metrics, loss)
+            return loss, metrics
 
-        (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
-            loss_fn, has_aux=True
-        )(params)
+        (loss, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+            params, rng
+        )
 
         if clipper is not None:
             grads, _ = clipper.update(grads, clipper_state)
@@ -300,52 +301,47 @@ def train_loop(config: TrainConfig):
 
         updates = jax.tree.map(scale_update, updates)
         params = optax.apply_updates(params, updates)
-        return params, opt_state, new_carry, unscaled_loss, metrics
+        return params, opt_state, loss, metrics
 
-    for _, batch, global_batch_size in train_loader:
+    for _, batch, _ in train_loader:
         if train_state.step >= train_state.total_steps:
             break
         batch_jnp = batch_to_jnp(batch)
 
-        if train_state.carry is None:
-            model = eqx.combine(train_state.params, train_state.static)
-            train_state.carry = model.initial_carry(batch_jnp)
-
         lr_main = compute_lr(config.lr, config, train_state)
-        rng, step_rng = jax.random.split(train_state.rng)
-        batch_pack = {
-            "data": batch_jnp,
-            "global_batch_size": jnp.asarray(global_batch_size, dtype=jnp.float32),
-        }
+        train_state.rng, step_rng = jax.random.split(train_state.rng)
+        step_rng, loss_rng = jax.random.split(step_rng)
+        outer_steps = compute_outer_steps(config, train_state)
+        step_size = sample_step_size(step_rng, static_model.config)
         (
             new_params,
             train_state.opt_state,
-            train_state.carry,
             loss,
             metrics,
         ) = train_step(
             train_state.params,
             train_state.opt_state,
-            train_state.carry,
-            batch_pack,
-            step_rng,
+            batch_jnp,
+            loss_rng,
             lr_main,
+            outer_steps,
+            step_size,
         )
         train_state.params = new_params
         train_state.step += 1
-        train_state.rng = rng
 
-        ema_helper.update(eqx.combine(train_state.params, train_state.static))
+        ema_helper.update(eqx.combine(train_state.params, static_model))
 
         metric_values = {k: float(v) for k, v in metrics.items()}
         if len(metric_values):
-            count = max(metric_values.get("count", 1.0), 1.0)
             logged = {
-                f"train/{k}": metric_values[k]
-                / (global_batch_size if k.endswith("loss") else count)
-                for k in metric_values
+                "train/loss": metric_values["loss"],
+                "train/token_accuracy": metric_values["token_accuracy"],
+                "train/seq_accuracy": metric_values["seq_accuracy"],
+                "train/lr": float(lr_main),
+                "train/outer_steps": float(outer_steps),
+                "train/step_size": float(step_size),
             }
-            logged["train/lr"] = float(lr_main)
             wandb.log(logged, step=train_state.step)
             progress_bar.update(train_state.step - progress_bar.n)
 
@@ -356,8 +352,8 @@ def train_loop(config: TrainConfig):
                 eval_model,
                 test_loader,
                 batch_converter=batch_to_jnp,
-                prepare_carry_fn=filter_carry,
                 rng=eval_step_rng,
+                num_outer_steps=outer_steps,
             )
             if eval_logs:
                 wandb.log(eval_logs, step=train_state.step)
@@ -373,7 +369,6 @@ def train_loop(config: TrainConfig):
                 lens_model,
                 test_batch,
                 test_metadata,
-                filter_carry_fn=filter_carry,
                 step=train_state.step,
                 rng=lens_step_rng,
             )
