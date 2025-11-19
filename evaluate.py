@@ -154,10 +154,8 @@ def _tokens_to_color_grid(tokens: np.ndarray, palette: np.ndarray, grid_size: in
     return colors.astype(np.uint8)
 
 
-def _hidden_to_tokens(
-    hidden_states: jnp.ndarray, lm_head, task_emb_len: int
-) -> jnp.ndarray:
-    logits = lm_head(hidden_states).astype(jnp.float32)
+def _logits_to_tokens(logits: jnp.ndarray, task_emb_len: int) -> jnp.ndarray:
+    logits = logits.astype(jnp.float32)
     logits = logits[..., task_emb_len:, :]
     return jnp.argmax(logits, axis=-1)
 
@@ -346,8 +344,8 @@ def evaluate_logit_lens(
     palette = _build_logit_lens_palette()
     grid_size = int(round(math.sqrt(metadata.seq_len)))
 
-    y_tokens = _hidden_to_tokens(y_hidden, model.lm_head, model.task_emb_len)
-    z_tokens = _hidden_to_tokens(z_hidden, model.lm_head, model.task_emb_len)
+    y_tokens = _logits_to_tokens(y_hidden, model.task_emb_len)
+    z_tokens = _logits_to_tokens(z_hidden, model.task_emb_len)
 
     y_tokens_np = np.take(np.asarray(jax.device_get(y_tokens)), 0, axis=2)
     z_tokens_np = np.take(np.asarray(jax.device_get(z_tokens)), 0, axis=3)

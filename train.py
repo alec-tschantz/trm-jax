@@ -17,7 +17,6 @@ from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from evaluate import evaluate_model, evaluate_logit_lens
 from trm.losses import act_loss
 from trm.model import Carry, Model
-from trm.ebm import EnergyModel, EnergyConfig
 from trm.utils import EMAHelper
 from trm.optim import adam_atan2, sparse_sign_sgd
 
@@ -43,9 +42,7 @@ class TrainConfig:
     ema_rate: float
     eval_every: int
     logit_lens_every: int
-    energy: Dict[str, Any] 
     model: Dict[str, Any]
-    model_type: str 
 
 
 DEFAULT_CONFIG = TrainConfig(
@@ -67,8 +64,6 @@ DEFAULT_CONFIG = TrainConfig(
     ema_rate=0.999,
     eval_every=1000,
     logit_lens_every=200,
-    model_type="trm",
-    energy=dict(lr=1.0),
     model=dict(
         halt_exploration_prob=0.1,
         halt_max_steps=16,
@@ -81,6 +76,9 @@ DEFAULT_CONFIG = TrainConfig(
         task_emb_ndim=512,
         forward_dtype="bfloat16",
         task_emb_len=16,
+        z_vocab_size=32,
+        energy_step_size=1.0,
+        energy_noise_scale=0.0,
     ),
 )
 
@@ -128,11 +126,7 @@ def create_model(
         num_task_identifiers=train_metadata.num_puzzle_identifiers,
     )
     key = jax.random.PRNGKey(config.seed)
-    if config.model_type.lower() == "energy":
-        energy_cfg = EnergyConfig(**config.energy)
-        model = EnergyModel(model_cfg, energy_cfg, key=key)
-    else:
-        model = Model(model_cfg, key=key)
+    model = Model(model_cfg, key=key)
     params, static = eqx.partition(model, eqx.is_array)
 
     def build_param_labels(p):
