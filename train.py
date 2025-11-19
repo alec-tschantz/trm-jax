@@ -18,7 +18,7 @@ from evaluate import evaluate_model, evaluate_logit_lens
 from trm.losses import act_loss
 from trm.model import Carry, Model
 from trm.utils import EMAHelper
-from trm.optim import adam_atan2, sparse_sign_sgd
+from trm.optim import adam_atan2
 
 
 
@@ -33,8 +33,6 @@ class TrainConfig:
     weight_decay: float
     beta1: float
     beta2: float
-    task_emb_lr: float
-    task_emb_weight_decay: float
     grad_clip_norm: float | None
     project_name: str
     run_name: str
@@ -55,8 +53,6 @@ DEFAULT_CONFIG = TrainConfig(
     weight_decay=1.0,
     beta1=0.9,
     beta2=0.95,
-    task_emb_lr=1e-4,
-    task_emb_weight_decay=1.0,
     grad_clip_norm=1.0,
     project_name="energy-trm",
     run_name="energy-logits",
@@ -73,9 +69,8 @@ DEFAULT_CONFIG = TrainConfig(
         hidden_size=512,
         num_heads=8,
         expansion=4,
-        task_emb_ndim=512,
+        z_vocab_size=64,
         forward_dtype="bfloat16",
-        task_emb_len=16,
         energy_step_size=0.1,
         energy_noise_scale=0.1,
     ),
@@ -122,31 +117,18 @@ def create_model(
         batch_size=config.global_batch_size,
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
-        num_task_identifiers=train_metadata.num_puzzle_identifiers,
     )
     key = jax.random.PRNGKey(config.seed)
     model = Model(model_cfg, key=key)
     params, static = eqx.partition(model, eqx.is_array)
 
-    def build_param_labels(p):
-        labels = jax.tree.map(lambda _: 0, p)
-        labels = eqx.tree_at(lambda tree: tree.task_embed.weight, labels, 1)
-        return labels
-
-    param_labels = build_param_labels(params)
-
-    transforms = {
-        0: adam_atan2(
-            beta1=config.beta1,
-            beta2=config.beta2,
-            weight_decay=config.weight_decay,
-        ),
-        1: sparse_sign_sgd(weight_decay=config.task_emb_weight_decay),
-    }
-
-    optimizer = optax.multi_transform(transforms, build_param_labels)
+    optimizer = adam_atan2(
+        beta1=config.beta1,
+        beta2=config.beta2,
+        weight_decay=config.weight_decay,
+    )
     opt_state = optimizer.init(params)
-    return params, static, optimizer, opt_state, param_labels
+    return params, static, optimizer, opt_state
 
 
 def cosine_schedule_with_warmup_lr_lambda(
@@ -185,9 +167,7 @@ def create_train_state(
         * train_metadata.mean_puzzle_examples
         / config.global_batch_size
     )
-    params, static, optimizer, opt_state, param_labels = create_model(
-        config, train_metadata
-    )
+    params, static, optimizer, opt_state = create_model(config, train_metadata)
     rng = jax.random.PRNGKey(config.seed + 1)
     return (
         TrainState(
@@ -200,7 +180,6 @@ def create_train_state(
             rng=rng,
         ),
         optimizer,
-        param_labels,
     )
 
 
@@ -265,7 +244,7 @@ def train_loop(config: TrainConfig):
 
     test_loader_iter = infinite_dataloader(test_loader)
 
-    train_state, optimizer, param_labels = create_train_state(config, train_metadata)
+    train_state, optimizer = create_train_state(config, train_metadata)
 
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
     wandb.init(
@@ -291,7 +270,7 @@ def train_loop(config: TrainConfig):
     clipper_state = optax.EmptyState() if clipper is not None else None
 
     @eqx.filter_jit
-    def train_step(params, opt_state, carry, batch, rng, lr_main, lr_task):
+    def train_step(params, opt_state, carry, batch, rng, lr_main):
         gb = jnp.asarray(batch["global_batch_size"], dtype=jnp.float32)
 
         def loss_fn(p):
@@ -314,13 +293,12 @@ def train_loop(config: TrainConfig):
 
         updates, opt_state = optimizer.update(grads, opt_state, params)
 
-        def scale_update(update, label):
+        def scale_update(update):
             if update is None:
                 return None
-            lr = jnp.where(jnp.equal(label, 1), lr_task, lr_main)
-            return update * lr
+            return update * lr_main
 
-        updates = jax.tree.map(scale_update, updates, param_labels)
+        updates = jax.tree.map(scale_update, updates)
         params = optax.apply_updates(params, updates)
         return params, opt_state, new_carry, unscaled_loss, metrics
 
@@ -334,7 +312,6 @@ def train_loop(config: TrainConfig):
             train_state.carry = model.initial_carry(batch_jnp)
 
         lr_main = compute_lr(config.lr, config, train_state)
-        lr_task = compute_lr(config.task_emb_lr, config, train_state)
         rng, step_rng = jax.random.split(train_state.rng)
         batch_pack = {
             "data": batch_jnp,
@@ -353,7 +330,6 @@ def train_loop(config: TrainConfig):
             batch_pack,
             step_rng,
             lr_main,
-            lr_task,
         )
         train_state.params = new_params
         train_state.step += 1
@@ -370,7 +346,6 @@ def train_loop(config: TrainConfig):
                 for k in metric_values
             }
             logged["train/lr"] = float(lr_main)
-            logged["train/task_lr"] = float(lr_task)
             wandb.log(logged, step=train_state.step)
             progress_bar.update(train_state.step - progress_bar.n)
 

@@ -11,10 +11,6 @@ class AdamAtan2State(NamedTuple):
     exp_avg_sq: Any
 
 
-class SparseSignSGDState(NamedTuple):
-    pass
-
-
 def adam_atan2(
     *,
     beta1: float = 0.9,
@@ -73,27 +69,5 @@ def adam_atan2(
         updates = jax.tree.map(compute_update, exp_avg, exp_avg_sq, grads, params)
         new_state = AdamAtan2State(count=count, exp_avg=exp_avg, exp_avg_sq=exp_avg_sq)
         return updates, new_state
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-def sparse_sign_sgd(*, weight_decay: float = 0.0) -> optax.GradientTransformation:
-    weight_decay = jnp.asarray(weight_decay)
-
-    def init_fn(params):
-        return SparseSignSGDState()
-
-    def update_fn(grads, state, params):
-        def compute_update(g, p):
-            if (g is None) or (p is None):
-                return None
-            finite_grad = jnp.where(jnp.isfinite(g), g, 0.0)
-            mask = jnp.any(finite_grad != 0.0, axis=-1, keepdims=True)
-            mask = mask.astype(p.dtype)
-            signed = jnp.sign(finite_grad)
-            return -mask * (signed + weight_decay * p)
-
-        updates = jax.tree.map(compute_update, grads, params)
-        return updates, state
 
     return optax.GradientTransformation(init_fn, update_fn)
