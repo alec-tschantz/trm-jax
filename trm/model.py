@@ -43,8 +43,8 @@ class ModelConfig(BaseModel):
 
     forward_dtype: str = "bfloat16"
     task_emb_len: int = 16
-    energy_step_size: float = 0.01
-    energy_noise_scale: float = 0.01
+    energy_step_size: float = 0.1
+    energy_noise_scale: float = 0.1
 
 
 class State(eqx.Module):

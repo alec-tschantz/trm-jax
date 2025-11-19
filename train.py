@@ -59,7 +59,7 @@ DEFAULT_CONFIG = TrainConfig(
     task_emb_weight_decay=1.0,
     grad_clip_norm=1.0,
     project_name="energy-trm",
-    run_name="trm",
+    run_name="energy-logits",
     seed=0,
     ema_rate=0.999,
     eval_every=1000,
@@ -76,8 +76,8 @@ DEFAULT_CONFIG = TrainConfig(
         task_emb_ndim=512,
         forward_dtype="bfloat16",
         task_emb_len=16,
-        energy_step_size=1.0,
-        energy_noise_scale=0.0,
+        energy_step_size=0.1,
+        energy_noise_scale=0.1,
     ),
 )
 
