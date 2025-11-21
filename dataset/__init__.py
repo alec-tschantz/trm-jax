@@ -1,1 +1,1 @@
-from .dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from .dataset import Dataset, DatasetConfig, DatasetMetadata

@@ -1,26 +1,25 @@
 import math
+from typing import Dict
 from dataclasses import dataclass
-from typing import Dict, Tuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from pydantic import BaseModel
 
 from trm.utils import trunc_normal
 from trm.nn import (
-    Attention,
+    Block,
+    CosSin,
     Embedding,
     Linear,
-    CosSin,
     RotaryEmbedding,
     SparseEmbedding,
-    SwiGLU,
-    rms_norm,
+    Transformer,
 )
 
 
-class ModelConfig(BaseModel):
+@dataclass
+class ModelConfig:
     batch_size: int
     seq_len: int
     task_emb_ndim: int
@@ -35,14 +34,14 @@ class ModelConfig(BaseModel):
     expansion: float
     num_heads: int
 
-    rms_norm_eps: float = 1e-5
-    rope_theta: float = 10000.0
-
     halt_max_steps: int
     halt_exploration_prob: float
 
-    forward_dtype: str = "bfloat16"
-    task_emb_len: int = 16
+    forward_dtype: str
+    task_emb_len: int
+
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
 
 
 class State(eqx.Module):
@@ -55,50 +54,6 @@ class Carry(eqx.Module):
     steps: jnp.ndarray
     halted: jnp.ndarray
     data: Dict[str, jnp.ndarray]
-
-
-class Block(eqx.Module):
-    self_attn: Attention
-    mlp: SwiGLU
-    norm_eps: float = eqx.field(static=True)
-
-    def __init__(self, config: ModelConfig, *, key):
-        k1, k2 = jax.random.split(key)
-        self.self_attn = Attention(
-            hidden_size=config.hidden_size,
-            head_dim=config.hidden_size // config.num_heads,
-            num_heads=config.num_heads,
-            num_key_value_heads=config.num_heads,
-            causal=False,
-            key=k1,
-        )
-        self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion,
-            key=k2,
-        )
-        self.norm_eps = config.rms_norm_eps
-
-    def __call__(self, cos_sin: CosSin, h: jnp.ndarray) -> jnp.ndarray:
-        dtype = h.dtype
-
-        attn_out = self.self_attn(cos_sin, h)
-        h2 = rms_norm(h + attn_out.astype(dtype), eps=self.norm_eps)
-
-        mlp_out = self.mlp(h2)
-        h3 = rms_norm(h2 + mlp_out.astype(dtype), eps=self.norm_eps)
-
-        return h3
-
-
-class Transformer(eqx.Module):
-    layers: Tuple[Block, ...]
-
-    def __call__(self, h: jnp.ndarray, x: jnp.ndarray, cos_sin: CosSin) -> jnp.ndarray:
-        h = h + x
-        for layer in self.layers:
-            h = layer(cos_sin, h)
-        return h
 
 
 class Model(eqx.Module):
@@ -116,8 +71,7 @@ class Model(eqx.Module):
     rotary_emb: RotaryEmbedding
     network: Transformer
 
-    def __init__(self, cfg: dict, *, key):
-        config = ModelConfig(**cfg)
+    def __init__(self, config: ModelConfig, *, key):
         self.config = config
 
         dtype = getattr(jnp, config.forward_dtype)
@@ -136,14 +90,6 @@ class Model(eqx.Module):
             cast_to=dtype,
         )
 
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False, key=k2)
-
-        q_head = Linear(config.hidden_size, 1, bias=True, key=k3)
-        q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
-        bias_val = jnp.full_like(q_head.bias, -5.0)
-        q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
-        self.q_head = q_head
-
         self.task_embed = SparseEmbedding(
             config.num_task_identifiers,
             config.task_emb_ndim,
@@ -158,8 +104,27 @@ class Model(eqx.Module):
             base=config.rope_theta,
         )
 
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False, key=k2)
+
+        q_head = Linear(config.hidden_size, 1, bias=True, key=k3)
+        q_head = eqx.tree_at(lambda m: m.weight, q_head, jnp.zeros_like(q_head.weight))
+        bias_val = jnp.full_like(q_head.bias, -5.0)
+        q_head = eqx.tree_at(lambda m: m.bias, q_head, bias_val)
+        self.q_head = q_head
+
         layer_keys = jax.random.split(k5, config.num_layers)
-        self.network = Transformer(tuple(Block(config, key=kk) for kk in layer_keys))
+        self.network = Transformer(
+            tuple(
+                Block(
+                    hidden_size=config.hidden_size,
+                    expansion=config.expansion,
+                    num_heads=config.num_heads,
+                    rms_norm_eps=config.rms_norm_eps,
+                    key=kk,
+                )
+                for kk in layer_keys
+            )
+        )
 
         self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
         self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
@@ -167,31 +132,32 @@ class Model(eqx.Module):
     def __call__(
         self,
         carry: Carry,
-        rng,
+        rng: jnp.ndarray,
         training: bool,
         *,
         record: bool = False,
     ):
         batch = carry.data
         cos_sin = self.rotary_emb()
-        embeddings = self.embed(batch["inputs"], batch["puzzle_identifiers"])
+        x_embed = self.embed_inputs(batch["inputs"], batch["puzzle_identifiers"])
 
-        state_rng, rng = jax.random.split(rng)
-
-        y, z, y_hist, z_hist = self.inference(
+        y, z, iters_aux = self.run_iters(
+            x_embed,
             carry.states.y,
             carry.states.z,
-            embeddings,
             cos_sin,
             record=record,
-            key=state_rng,
         )
 
-        logits = self.lm_head(y).astype(jnp.float32)[:, self.task_emb_len :, :]
-        qh = self.q_head(y[:, 0]).astype(jnp.float32).squeeze(-1)
-        new_steps, halted, rng = self._update_halt_state(carry.steps, qh, rng, training)
+        y_logits = self.lm_head(y).astype(jnp.float32)[:, self.task_emb_len :, :]
+        q_logits = self.q_head(y[:, 0]).astype(jnp.float32).squeeze(-1)
 
-        return Carry(
+        q_rng, rng = jax.random.split(rng)
+        new_steps, halted = self.update_halt_state(
+            carry.steps, q_logits, q_rng, training
+        )
+
+        carry = Carry(
             states=State(
                 y=jax.lax.stop_gradient(y),
                 z=jax.lax.stop_gradient(z),
@@ -199,87 +165,74 @@ class Model(eqx.Module):
             steps=new_steps,
             halted=halted,
             data=carry.data,
-        ), {
-            "logits": logits,
-            "q_halt_logits": qh,
-            "y_states": y_hist,
-            "z_states": z_hist,
-        }
+        )
+        aux = {**iters_aux, "y_logits": y_logits, "q_logits": q_logits}
+        return carry, aux
 
-    def update_state(
-        self,
-        state: jnp.ndarray,
-        context: jnp.ndarray,
-        cos_sin: CosSin,
-        key: jnp.ndarray,
-    ) -> jnp.ndarray:
-        return self.network(state, context, cos_sin).astype(self.forward_dtype)
+    def run_iters(self, x_embed, y, z, cos_sin, *, record=False):
+        x_embed = x_embed.astype(self.forward_dtype)
+        y0, z0 = y.astype(self.forward_dtype), z.astype(self.forward_dtype)
+        is_last = jnp.arange(self.config.y_cycles) == (self.config.y_cycles - 1)
 
-    def inference(
-        self,
-        y: jnp.ndarray,
-        z: jnp.ndarray,
-        embeddings: jnp.ndarray,
-        cos_sin: CosSin,
-        *,
-        record: bool = False,
-        key: jnp.ndarray,
-    ):
-        y_state = y.astype(self.forward_dtype)
-        z_state = z.astype(self.forward_dtype)
-        y_records = [] if record else None
-        z_records = [] if record else None
-
-        for idx in range(self.config.y_cycles):
-            x_inj = (y_state + embeddings).astype(self.forward_dtype)
-            key, z_rng = jax.random.split(key)
-
-            z_state, z_hist = self._run_z_cycles(
-                z_state, x_inj, cos_sin, record=record, key=z_rng
+        def body(carry, last):
+            y_curr, z_curr = carry
+            z_next, z_hist = self.run_z_iters(
+                x_embed, y_curr, z_curr, cos_sin, record=record
             )
+            y_next = self.network(y_curr, z_next, cos_sin).astype(self.forward_dtype)
+            y_c = jax.lax.cond(last, lambda x: x, jax.lax.stop_gradient, y_next)
+            z_c = jax.lax.cond(last, lambda x: x, jax.lax.stop_gradient, z_next)
+            hist = (jax.lax.stop_gradient(y_next), z_hist) if record else None
+            return (y_c, z_c), hist
 
-            key, y_rng = jax.random.split(key)
-            y_state = self.update_state(y_state, z_state, cos_sin, key=y_rng)
+        body = eqx.filter_checkpoint(body)
+        (y_final, z_final), hist = jax.lax.scan(body, (y0, z0), is_last)
+        y_hist, z_hist = hist if record else (None, None)
 
-            if record:
-                y_records.append(jax.lax.stop_gradient(y_state))
-                z_records.append(z_hist)
+        return y_final, z_final, {"y_hist": y_hist, "z_hist": z_hist}
 
-            if idx < self.config.y_cycles - 1:
-                y_state = jax.lax.stop_gradient(y_state)
-                z_state = jax.lax.stop_gradient(z_state)
-
-        y_records = jnp.stack(y_records) if record else None
-        z_records = jnp.stack(z_records) if record else None
-        return y_state, z_state, y_records, z_records
-
-    def _run_z_cycles(
+    def run_z_iters(
         self,
+        x_embed: jnp.ndarray,
+        y_state: jnp.ndarray,
         z_state: jnp.ndarray,
-        x_inj: jnp.ndarray,
         cos_sin: CosSin,
         *,
         record: bool,
-        key: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        keys = jax.random.split(key, self.config.z_cycles)
-
-        def body(z_curr, rng):
-            z_next = self.update_state(z_curr, x_inj, cos_sin, key=rng)
+        def body(z_curr, _):
+            context = (y_state + x_embed).astype(self.forward_dtype)
+            z_next = self.network(z_curr, context, cos_sin).astype(self.forward_dtype)
             hist = jax.lax.stop_gradient(z_next) if record else None
             return z_next, hist
 
         body = eqx.filter_checkpoint(body)
-        z_final, z_hist = jax.lax.scan(body, z_state, keys)
+        z_final, z_hist = jax.lax.scan(
+            body, z_state, xs=None, length=self.config.z_cycles
+        )
         return z_final, z_hist
 
-    def _update_halt_state(
+    def embed_inputs(self, inputs: jnp.ndarray, task_ids: jnp.ndarray) -> jnp.ndarray:
+        tok = self.embed_tokens(inputs.astype(jnp.int32))
+
+        task = self.task_embed(task_ids)
+        need = self.task_emb_len * self.config.hidden_size - task.shape[-1]
+        if need > 0:
+            task = jnp.pad(task, ((0, 0), (0, need)))
+
+        task = task.reshape(-1, self.task_emb_len, self.config.hidden_size)
+        emb = jnp.concatenate([task, tok], axis=1)
+
+        emb = (emb * self.embed_scale).astype(self.forward_dtype)
+        return emb
+
+    def update_halt_state(
         self,
         steps: jnp.ndarray,
         q_logits: jnp.ndarray,
         rng: jnp.ndarray,
         training: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         new_steps = steps + 1
         halted = new_steps >= self.config.halt_max_steps
 
@@ -301,18 +254,7 @@ class Model(eqx.Module):
             min_steps = jnp.where(sample, sampled_min, jnp.zeros_like(sampled_min))
             halted = jnp.logical_and(halted, new_steps >= min_steps)
 
-        return new_steps, halted, rng
-
-    def empty_state(self, batch_size: int) -> State:
-        zeros = jnp.zeros(
-            (
-                batch_size,
-                self.config.seq_len + self.task_emb_len,
-                self.config.hidden_size,
-            ),
-            dtype=self.forward_dtype,
-        )
-        return State(y=zeros, z=zeros)
+        return new_steps, halted
 
     def reset_states(self, reset: jnp.ndarray, states: State) -> State:
         flag = reset.reshape((-1, 1, 1))
@@ -322,25 +264,22 @@ class Model(eqx.Module):
         z = jnp.where(flag, z0, states.z)
         return State(y=y, z=z)
 
-    def embed(self, inputs: jnp.ndarray, task_ids: jnp.ndarray) -> jnp.ndarray:
-        tok = self.embed_tokens(inputs.astype(jnp.int32))
-
-        task = self.task_embed(task_ids)
-        need = self.task_emb_len * self.config.hidden_size - task.shape[-1]
-        if need > 0:
-            task = jnp.pad(task, ((0, 0), (0, need)))
-
-        task = task.reshape(-1, self.task_emb_len, self.config.hidden_size)
-        emb = jnp.concatenate([task, tok], axis=1)
-
-        emb = (emb * self.embed_scale).astype(self.forward_dtype)
-        return emb
-
     def initial_carry(self, batch: Dict[str, jnp.ndarray]) -> Carry:
         bs = batch["inputs"].shape[0]
         return Carry(
-            states=self.empty_state(bs),
+            states=self.initial_state(bs),
             steps=jnp.zeros((bs,), dtype=jnp.int32),
             halted=jnp.ones((bs,), dtype=jnp.bool_),
             data={k: jnp.zeros_like(v) for k, v in batch.items()},
         )
+
+    def initial_state(self, batch_size: int) -> State:
+        zeros = jnp.zeros(
+            (
+                batch_size,
+                self.config.seq_len + self.task_emb_len,
+                self.config.hidden_size,
+            ),
+            dtype=self.forward_dtype,
+        )
+        return State(y=zeros, z=zeros)

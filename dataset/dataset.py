@@ -14,7 +14,7 @@ from pydantic import BaseModel
 IGNORE_LABEL_ID = -100
 
 
-class PuzzleDatasetMetadata(pydantic.BaseModel):
+class DatasetMetadata(pydantic.BaseModel):
     pad_id: int
     ignore_label_id: Optional[int]
     blank_identifier_id: int
@@ -27,7 +27,7 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
     sets: List[str]
 
 
-class PuzzleDatasetConfig(pydantic.BaseModel):
+class DatasetConfig(pydantic.BaseModel):
     seed: int
     dataset_paths: List[str]
     global_batch_size: int
@@ -37,8 +37,8 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     num_replicas: int
 
 
-class PuzzleDataset(IterableDataset):
-    def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
+class Dataset(IterableDataset):
+    def __init__(self, config: DatasetConfig, split: str = "train"):
         super().__init__()
         self.config = config
         self.split = split
@@ -80,7 +80,7 @@ class PuzzleDataset(IterableDataset):
             num_identifiers += current_metadata.num_puzzle_identifiers
         mean_puzzle_examples = mean_puzzle_examples / total_puzzles
 
-        self.metadata = PuzzleDatasetMetadata(
+        self.metadata = DatasetMetadata(
             seq_len=prev_seq_len,
             vocab_size=prev_vocab_size,
             pad_id=prev_pad_id,
@@ -103,9 +103,9 @@ class PuzzleDataset(IterableDataset):
         self._data = None
         self._iters = 0
 
-    def _load_metadata(self, dataset_path) -> PuzzleDatasetMetadata:
+    def _load_metadata(self, dataset_path) -> DatasetMetadata:
         with open(os.path.join(dataset_path, self.split, "dataset.json"), "r") as f:
-            return PuzzleDatasetMetadata(**json.load(f))
+            return DatasetMetadata(**json.load(f))
 
     def _lazy_load_dataset(self):
         if self._data is not None:

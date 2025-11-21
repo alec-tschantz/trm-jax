@@ -11,30 +11,6 @@ from trm.utils import trunc_normal
 CosSin = Tuple[jnp.ndarray, jnp.ndarray]
 
 
-def _find_multiple(a: int, b: int) -> int:
-    return (-(a // -b)) * b
-
-
-def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
-    half = x.shape[-1] // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-
-def apply_rotary_pos_emb(
-    q: jnp.ndarray, k: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    orig_dtype = q.dtype
-    cos = cos[None, :, None, :]
-    sin = sin[None, :, None, :]
-    q = q.astype(cos.dtype)
-    k = k.astype(cos.dtype)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
-
-
 class Linear(eqx.Module):
     weight: jnp.ndarray
     bias: jnp.ndarray | None
@@ -227,9 +203,85 @@ class SwiGLU(eqx.Module):
         return self.down_proj(jax.nn.silu(gate) * up)
 
 
+class Block(eqx.Module):
+    self_attn: Attention
+    mlp: SwiGLU
+    norm_eps: float = eqx.field(static=True)
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        expansion: float,
+        num_heads: int,
+        rms_norm_eps: float,
+        key,
+    ):
+        k1, k2 = jax.random.split(key)
+        self.self_attn = Attention(
+            hidden_size=hidden_size,
+            head_dim=hidden_size // num_heads,
+            num_heads=num_heads,
+            num_key_value_heads=num_heads,
+            causal=False,
+            key=k1,
+        )
+        self.mlp = SwiGLU(
+            hidden_size=hidden_size,
+            expansion=expansion,
+            key=k2,
+        )
+        self.norm_eps = rms_norm_eps
+
+    def __call__(self, cos_sin: CosSin, h: jnp.ndarray) -> jnp.ndarray:
+        dtype = h.dtype
+
+        attn_out = self.self_attn(cos_sin, h)
+        h2 = rms_norm(h + attn_out.astype(dtype), eps=self.norm_eps)
+
+        mlp_out = self.mlp(h2)
+        h3 = rms_norm(h2 + mlp_out.astype(dtype), eps=self.norm_eps)
+
+        return h3
+
+
+class Transformer(eqx.Module):
+    layers: Tuple[Block, ...]
+
+    def __call__(self, h: jnp.ndarray, x: jnp.ndarray, cos_sin: CosSin) -> jnp.ndarray:
+        h = h + x
+        for layer in self.layers:
+            h = layer(cos_sin, h)
+        return h
+
+
 def rms_norm(hidden_states: jnp.ndarray, eps: float) -> jnp.ndarray:
     orig_dtype = hidden_states.dtype
     hidden_states = hidden_states.astype(jnp.float32)
     variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
     hidden_states = hidden_states * jax.lax.rsqrt(variance + eps)
     return hidden_states.astype(orig_dtype)
+
+
+def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+
+def apply_rotary_pos_emb(
+    q: jnp.ndarray, k: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    orig_dtype = q.dtype
+    cos = cos[None, :, None, :]
+    sin = sin[None, :, None, :]
+    q = q.astype(cos.dtype)
+    k = k.astype(cos.dtype)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
+
+
+def _find_multiple(a: int, b: int) -> int:
+    return (-(a // -b)) * b

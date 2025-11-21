@@ -11,7 +11,7 @@ from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 
-from dataset import PuzzleDatasetMetadata
+from dataset import DatasetMetadata
 
 
 CHARSET = "# SGo"
@@ -128,7 +128,7 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         "puzzle_identifiers": np.array(results["puzzle_identifiers"], dtype=np.int32),
     }
 
-    metadata = PuzzleDatasetMetadata(
+    metadata = DatasetMetadata(
         seq_len=int(math.prod(grid_size)),
         vocab_size=len(CHARSET) + 1,
         pad_id=0,

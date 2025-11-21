@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Dict
 
 import equinox as eqx
 import jax
@@ -8,81 +8,50 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
 import torch
-from torch.utils.data import DataLoader
+import tyro
 import tqdm
 import wandb
-import tyro
+from torch.utils.data import DataLoader
 
-from dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from dataset import Dataset, DatasetConfig, DatasetMetadata
 from evaluate import evaluate_model, evaluate_logit_lens
 from trm.losses import act_loss
-from trm.model import Carry, Model
-from trm.ebm import EnergyModel, EnergyConfig
+from trm.model import Carry, Model, ModelConfig
+from trm.optim import adam_atan2, sparse_sign_sgd, cosine_warmup_schedule
 from trm.utils import EMAHelper
-from trm.optim import adam_atan2, sparse_sign_sgd
-
 
 
 @dataclass
 class TrainConfig:
-    data_paths: List[str]
-    global_batch_size: int
-    epochs: int
-    lr: float
-    lr_min_ratio: float
-    lr_warmup_steps: int
-    weight_decay: float
-    beta1: float
-    beta2: float
-    task_emb_lr: float
-    task_emb_weight_decay: float
-    grad_clip_norm: float | None
-    project_name: str
-    run_name: str
-    seed: int
-    ema_rate: float
-    eval_every: int
-    logit_lens_every: int
-    energy: Dict[str, Any] 
-    model: Dict[str, Any]
-    model_type: str 
-
-
-DEFAULT_CONFIG = TrainConfig(
-    data_paths=["data/maze-30x30-hard-1k"],
-    global_batch_size=96,
-    epochs=50000,
-    lr=1e-4,
-    lr_min_ratio=1.0,
-    lr_warmup_steps=2000,
-    weight_decay=1.0,
-    beta1=0.9,
-    beta2=0.95,
-    task_emb_lr=1e-4,
-    task_emb_weight_decay=1.0,
-    grad_clip_norm=1.0,
-    project_name="energy-trm",
-    run_name="trm",
-    seed=0,
-    ema_rate=0.999,
-    eval_every=1000,
-    logit_lens_every=200,
-    model_type="trm",
-    energy=dict(lr=1.0),
-    model=dict(
-        halt_exploration_prob=0.1,
-        halt_max_steps=16,
-        y_cycles=3,
-        z_cycles=4,
-        num_layers=2,
-        hidden_size=512,
-        num_heads=8,
-        expansion=4,
-        task_emb_ndim=512,
-        forward_dtype="bfloat16",
-        task_emb_len=16,
-    ),
-)
+    data_path: str = "data/maze-30x30-hard-1k"
+    global_batch_size: int = 192
+    epochs: int = 50000
+    lr: float = 1e-4
+    lr_min_ratio: float = 1.0
+    lr_warmup_steps: int = 2000
+    weight_decay: float = 1.0
+    beta1: float = 0.9
+    beta2: float = 0.95
+    task_emb_lr: float = 1e-4
+    task_emb_weight_decay: float = 1.0
+    grad_clip_norm: float = 1.0
+    project_name: str = "trm-arc"
+    run_name: str = "trm-maze"
+    seed: int = 0
+    ema_rate: float = 0.999
+    eval_every: int = 1000
+    logit_lens_every: int = 200
+    halt_exploration_prob: float = 0.1
+    halt_max_steps: int = 16
+    y_cycles: int = 3
+    z_cycles: int = 4
+    num_layers: int = 2
+    hidden_size: int = 512
+    num_heads: int = 8
+    expansion: int = 4
+    task_emb_ndim: int = 512
+    forward_dtype: str = "bfloat16"
+    task_emb_len: int = 16
 
 
 @dataclass
@@ -96,47 +65,35 @@ class TrainState:
     rng: jnp.ndarray
 
 
-def create_dataloader(config: TrainConfig, split: str, **kwargs):
-    dataset = PuzzleDataset(
-        PuzzleDatasetConfig(
-            seed=config.seed,
-            dataset_paths=config.data_paths,
-            rank=0,
-            num_replicas=1,
-            **kwargs,
-        ),
-        split=split,
-    )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=None,
-        num_workers=0,
-        pin_memory=True,
-    )
-    return dataloader, dataset.metadata
-
-
 def create_model(
     config: TrainConfig,
-    train_metadata: PuzzleDatasetMetadata,
+    train_metadata: DatasetMetadata,
+    *,
+    key: jnp.ndarray,
 ):
-    model_cfg = dict(
-        **config.model,
+    model_cfg = ModelConfig(
         batch_size=config.global_batch_size,
-        vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
+        task_emb_ndim=config.task_emb_ndim,
         num_task_identifiers=train_metadata.num_puzzle_identifiers,
+        vocab_size=train_metadata.vocab_size,
+        y_cycles=config.y_cycles,
+        z_cycles=config.z_cycles,
+        num_layers=config.num_layers,
+        hidden_size=config.hidden_size,
+        expansion=config.expansion,
+        num_heads=config.num_heads,
+        halt_max_steps=config.halt_max_steps,
+        halt_exploration_prob=config.halt_exploration_prob,
+        forward_dtype=config.forward_dtype,
+        task_emb_len=config.task_emb_len,
     )
-    key = jax.random.PRNGKey(config.seed)
-    if config.model_type.lower() == "energy":
-        energy_cfg = EnergyConfig(**config.energy)
-        model = EnergyModel(model_cfg, energy_cfg, key=key)
-    else:
-        model = Model(model_cfg, key=key)
+
+    model = Model(model_cfg, key=key)
     params, static = eqx.partition(model, eqx.is_array)
 
     def build_param_labels(p):
-        labels = jax.tree.map(lambda _: 0, p)
+        labels = jtu.tree_map(lambda _: 0, p)
         labels = eqx.tree_at(lambda tree: tree.task_embed.weight, labels, 1)
         return labels
 
@@ -156,35 +113,12 @@ def create_model(
     return params, static, optimizer, opt_state, param_labels
 
 
-def cosine_schedule_with_warmup_lr_lambda(
-    current_step: int,
-    *,
-    base_lr: float,
-    num_warmup_steps: int,
-    num_training_steps: int,
-    min_ratio: float = 0.0,
-    num_cycles: float = 0.5,
-):
-    if current_step < num_warmup_steps:
-        return base_lr * float(current_step) / float(max(1, num_warmup_steps))
-
-    progress = float(current_step - num_warmup_steps) / float(
-        max(1, num_training_steps - num_warmup_steps)
-    )
-    return base_lr * (
-        min_ratio
-        + max(
-            0.0,
-            (1 - min_ratio)
-            * 0.5
-            * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
-        )
-    )
-
-
 def create_train_state(
     config: TrainConfig,
-    train_metadata: PuzzleDatasetMetadata,
+    train_metadata: DatasetMetadata,
+    *,
+    model_key: jnp.ndarray,
+    train_key: jnp.ndarray,
 ):
     total_steps = int(
         config.epochs
@@ -193,9 +127,8 @@ def create_train_state(
         / config.global_batch_size
     )
     params, static, optimizer, opt_state, param_labels = create_model(
-        config, train_metadata
+        config, train_metadata, key=model_key
     )
-    rng = jax.random.PRNGKey(config.seed + 1)
     return (
         TrainState(
             params=params,
@@ -204,15 +137,45 @@ def create_train_state(
             carry=None,
             step=0,
             total_steps=total_steps,
-            rng=rng,
+            rng=train_key,
         ),
         optimizer,
         param_labels,
     )
 
 
+def create_dataloader(config: TrainConfig, split: str, **kwargs):
+    dataset = Dataset(
+        DatasetConfig(
+            seed=config.seed,
+            dataset_paths=[config.data_path],
+            rank=0,
+            num_replicas=1,
+            **kwargs,
+        ),
+        split=split,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=0,
+        pin_memory=True,
+    )
+    return dataloader, dataset.metadata
+
+
+def infinite_dataloader(dataloader: DataLoader):
+    while True:
+        for batch in dataloader:
+            yield batch
+
+
+def batch_to_jnp(batch: Dict[str, torch.Tensor]) -> Dict[str, jnp.ndarray]:
+    return {k: jnp.asarray(v.detach().cpu().numpy()) for k, v in batch.items()}
+
+
 def compute_lr(base_lr: float, config: TrainConfig, train_state: TrainState):
-    lr = cosine_schedule_with_warmup_lr_lambda(
+    lr = cosine_warmup_schedule(
         current_step=train_state.step,
         base_lr=base_lr,
         num_warmup_steps=round(config.lr_warmup_steps),
@@ -220,10 +183,6 @@ def compute_lr(base_lr: float, config: TrainConfig, train_state: TrainState):
         min_ratio=config.lr_min_ratio,
     )
     return jnp.array(lr, dtype=jnp.float32)
-
-
-def batch_to_jnp(batch: Dict[str, torch.Tensor]) -> Dict[str, jnp.ndarray]:
-    return {k: jnp.asarray(v.detach().cpu().numpy()) for k, v in batch.items()}
 
 
 def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> Carry:
@@ -246,13 +205,42 @@ def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> C
     )
 
 
-def infinite_dataloader(dataloader: DataLoader):
-    while True:
-        for batch in dataloader:
-            yield batch
+def make_train_step(static_model, optimizer, param_labels, clipper):
+    @eqx.filter_jit
+    def train_step(
+        params, opt_state, carry, batch_data, global_batch_size, rng, lr_main, lr_task
+    ):
+        gb = jnp.asarray(global_batch_size, dtype=jnp.float32)
+
+        def loss_fn(p):
+            model = eqx.combine(p, static_model)
+            inp_carry = filter_carry(model, carry, batch_data)
+            new_carry, loss, metrics, _ = act_loss(
+                model, inp_carry, rng=rng, training=True
+            )
+            return loss / gb, (new_carry, metrics, loss)
+
+        (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
+            loss_fn, has_aux=True
+        )(params)
+
+        grads, _ = clipper.update(grads, optax.EmptyState())
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+
+        def scale_update(update, label):
+            if update is None:
+                return None
+            lr = jnp.where(jnp.equal(label, 1), lr_task, lr_main)
+            return update * lr
+
+        updates = jax.tree.map(scale_update, updates, param_labels)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, new_carry, unscaled_loss, metrics
+
+    return train_step
 
 
-def train_loop(config: TrainConfig):
+def main(config: TrainConfig = TrainConfig()):
     torch.random.manual_seed(config.seed)
 
     train_loader, train_metadata = create_dataloader(
@@ -272,68 +260,32 @@ def train_loop(config: TrainConfig):
 
     test_loader_iter = infinite_dataloader(test_loader)
 
-    train_state, optimizer, param_labels = create_train_state(config, train_metadata)
+    rng = jax.random.PRNGKey(config.seed)
+    rngs = jax.random.split(rng, 5)
+    rng, model_key, train_key, eval_rng, logit_lens_rng = rngs
+
+    train_state, optimizer, param_labels = create_train_state(
+        config, train_metadata, model_key=model_key, train_key=train_key
+    )
 
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
     wandb.init(
         project=config.project_name,
         name=config.run_name,
-        config={**config.__dict__, "model": config.model},
+        config=config.__dict__,
         settings=wandb.Settings(_disable_stats=True),
-    )
-    wandb.log(
-        {"num_params": sum(x.size for x in jtu.tree_leaves(train_state.params))},
-        step=0,
     )
 
     ema_helper = EMAHelper(mu=config.ema_rate)
     ema_helper.register(eqx.combine(train_state.params, train_state.static))
-    static_model = train_state.static
-    eval_rng = jax.random.PRNGKey(config.seed + 42)
-    logit_lens_rng = jax.random.PRNGKey(config.seed + 4242)
-    max_grad_norm = config.grad_clip_norm
-    clipper = (
-        optax.clip_by_global_norm(max_grad_norm) if max_grad_norm is not None else None
-    )
-    clipper_state = optax.EmptyState() if clipper is not None else None
+    clipper = optax.clip_by_global_norm(config.grad_clip_norm)
 
-    @eqx.filter_jit
-    def train_step(params, opt_state, carry, batch, rng, lr_main, lr_task):
-        gb = jnp.asarray(batch["global_batch_size"], dtype=jnp.float32)
-
-        def loss_fn(p):
-            model = eqx.combine(p, static_model)
-            prepared_carry = filter_carry(model, carry, batch["data"])
-            new_carry, loss, metrics, _, _ = act_loss(
-                model,
-                prepared_carry,
-                rng=rng,
-                training=True,
-            )
-            return loss / gb, (new_carry, metrics, loss)
-
-        (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
-            loss_fn, has_aux=True
-        )(params)
-
-        if clipper is not None:
-            grads, _ = clipper.update(grads, clipper_state)
-
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-
-        def scale_update(update, label):
-            if update is None:
-                return None
-            lr = jnp.where(jnp.equal(label, 1), lr_task, lr_main)
-            return update * lr
-
-        updates = jax.tree.map(scale_update, updates, param_labels)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, new_carry, unscaled_loss, metrics
+    train_step = make_train_step(train_state.static, optimizer, param_labels, clipper)
 
     for _, batch, global_batch_size in train_loader:
         if train_state.step >= train_state.total_steps:
             break
+
         batch_jnp = batch_to_jnp(batch)
 
         if train_state.carry is None:
@@ -343,10 +295,7 @@ def train_loop(config: TrainConfig):
         lr_main = compute_lr(config.lr, config, train_state)
         lr_task = compute_lr(config.task_emb_lr, config, train_state)
         rng, step_rng = jax.random.split(train_state.rng)
-        batch_pack = {
-            "data": batch_jnp,
-            "global_batch_size": jnp.asarray(global_batch_size, dtype=jnp.float32),
-        }
+
         (
             new_params,
             train_state.opt_state,
@@ -357,7 +306,8 @@ def train_loop(config: TrainConfig):
             train_state.params,
             train_state.opt_state,
             train_state.carry,
-            batch_pack,
+            batch_jnp,
+            jnp.asarray(global_batch_size, dtype=jnp.float32),
             step_rng,
             lr_main,
             lr_task,
@@ -388,11 +338,11 @@ def train_loop(config: TrainConfig):
                 eval_model,
                 test_loader,
                 batch_converter=batch_to_jnp,
-                prepare_carry_fn=filter_carry,
+                filter_carry_fn=filter_carry,
                 rng=eval_step_rng,
             )
-            if eval_logs:
-                wandb.log(eval_logs, step=train_state.step)
+            wandb.log(eval_logs, step=train_state.step)
+
         if (
             config.logit_lens_every > 0
             and train_state.step % config.logit_lens_every == 0
@@ -411,10 +361,6 @@ def train_loop(config: TrainConfig):
             )
 
     wandb.finish()
-
-
-def main(config: TrainConfig = DEFAULT_CONFIG):
-    train_loop(config)
 
 
 if __name__ == "__main__":

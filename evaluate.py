@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 import wandb
 from torch.utils.data import DataLoader
 
-from dataset import PuzzleDatasetMetadata
+from dataset import DatasetMetadata
 from trm.losses import act_loss
 from trm.model import Carry, Model
 
@@ -45,64 +45,14 @@ class EvalState(NamedTuple):
     lm_loss: jnp.ndarray
 
 
-def _zero_eval_state(dtype=jnp.float32) -> EvalState:
-    zero = jnp.array(0.0, dtype=dtype)
-    return EvalState(zero, zero, zero, zero, zero)
-
-
-@eqx.filter_jit
-def _eval_rollout(
-    model: Model,
-    carry: Carry,
-    rng: jnp.ndarray,
-    max_steps: int,
-) -> EvalState:
-    max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
-
-    def cond_fn(state):
-        _, _, _, steps, finished = state
-        return jnp.logical_and(steps < max_steps, jnp.logical_not(finished))
-
-    def body_fn(state):
-        carry, rng, agg, steps, finished = state
-        rng, step_rng = jax.random.split(rng)
-        carry, _loss, metrics, _, all_finish = act_loss(
-            model,
-            carry,
-            rng=step_rng,
-            training=False,
-        )
-        new_agg = EvalState(
-            accuracy=agg.accuracy + metrics["accuracy"],
-            exact_accuracy=agg.exact_accuracy + metrics["exact_accuracy"],
-            q_halt_accuracy=agg.q_halt_accuracy + metrics["q_halt_accuracy"],
-            count=agg.count + metrics["count"],
-            lm_loss=metrics["lm_loss"],
-        )
-        new_finished = jnp.logical_or(finished, all_finish)
-        return carry, rng, new_agg, steps + 1, new_finished
-
-    init_state = (
-        carry,
-        rng,
-        _zero_eval_state(),
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(False),
-    )
-
-    _, _, aggregates, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
-    return aggregates
-
-
 def evaluate_model(
     model: Model,
     dataloader: DataLoader,
     *,
     batch_converter: Callable[[Dict[str, Any]], Dict[str, jnp.ndarray]],
-    prepare_carry_fn: Callable[[Model, Carry, Dict[str, jnp.ndarray]], Carry],
-    rng: jnp.ndarray | None = None,
+    filter_carry_fn: Callable[[Model, Carry, Dict[str, jnp.ndarray]], Carry],
+    rng: jnp.ndarray,
 ) -> Dict[str, float]:
-    eval_rng = rng if rng is not None else jax.random.PRNGKey(0)
     totals = {
         "lm_loss": 0.0,
         "accuracy": 0.0,
@@ -111,19 +61,15 @@ def evaluate_model(
         "count": 0.0,
         "loss_denominator": 0.0,
     }
-    max_steps = getattr(model.config, "halt_max_steps", 1)
+    max_steps = model.config.halt_max_steps
 
     for _, batch, global_batch_size in dataloader:
         batch_jnp = batch_converter(batch)
         carry = model.initial_carry(batch_jnp)
-        carry = prepare_carry_fn(model, carry, batch_jnp)
-        eval_rng, batch_rng = jax.random.split(eval_rng)
-        aggregates = _eval_rollout(
-            model,
-            carry,
-            batch_rng,
-            max_steps,
-        )
+        carry = filter_carry_fn(model, carry, batch_jnp)
+
+        rng, rollout_rng = jax.random.split(rng)
+        aggregates = _eval_rollout(model, carry, max_steps, rollout_rng)
         aggregates = jtu.tree_map(lambda x: float(x), aggregates)
         totals["accuracy"] += aggregates.accuracy
         totals["exact_accuracy"] += aggregates.exact_accuracy
@@ -141,6 +87,173 @@ def evaluate_model(
         results["test/exact_accuracy"] = totals["exact_accuracy"] / denom
         results["test/q_halt_accuracy"] = totals["q_halt_accuracy"] / denom
     return results
+
+
+def evaluate_logit_lens(
+    model: Model,
+    batch: Dict[str, jnp.ndarray],
+    metadata: DatasetMetadata,
+    filter_carry_fn,
+    *,
+    step: int,
+    rng: jnp.ndarray,
+):
+    single = {
+        k: v[:1]
+        for k, v in batch.items()
+        if k in ("inputs", "labels", "puzzle_identifiers")
+    }
+    carry = model.initial_carry(single)
+    carry = filter_carry_fn(model, carry, single)
+    _, y_hidden, z_hidden = _rollout_state_histories(model, carry, rng)
+
+    palette = _build_logit_lens_palette()
+    grid_size = int(round(math.sqrt(metadata.seq_len)))
+
+    y_tokens = _hidden_to_tokens(y_hidden, model.lm_head, model.task_emb_len)
+    z_tokens = _hidden_to_tokens(z_hidden, model.lm_head, model.task_emb_len)
+
+    y_tokens_np = np.asarray(jax.device_get(y_tokens))[:, :, 0]  
+    z_tokens_np = np.asarray(jax.device_get(z_tokens))[:, :, :, 0]  
+
+    sample_inputs = np.asarray(jax.device_get(single["inputs"][0]))
+    sample_labels = np.asarray(jax.device_get(single["labels"][0]))
+
+    frames = _render_logit_lens_frames(
+        y_tokens_np,
+        z_tokens_np,
+        sample_inputs,
+        sample_labels,
+        palette,
+        grid_size,
+    )
+
+    wandb.log(
+        {"logit_lens/video": wandb.Video(frames, format="mp4", fps=4)},
+        step=step,
+    )
+
+
+@eqx.filter_jit
+def _eval_rollout(
+    model: Model, carry: Carry, max_steps: int, rng: jnp.ndarray
+) -> EvalState:
+    max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
+
+    def cond_fn(state):
+        _, _, steps, finished, _ = state
+        return jnp.logical_and(steps < max_steps, jnp.logical_not(finished))
+
+    def body_fn(state):
+        carry, agg, steps, finished, rng = state
+        rng, step_rng = jax.random.split(rng)
+        carry, _loss, metrics, all_finish = act_loss(
+            model, carry, rng=step_rng, training=False
+        )
+        new_agg = EvalState(
+            accuracy=agg.accuracy + metrics["accuracy"],
+            exact_accuracy=agg.exact_accuracy + metrics["exact_accuracy"],
+            q_halt_accuracy=agg.q_halt_accuracy + metrics["q_halt_accuracy"],
+            count=agg.count + metrics["count"],
+            lm_loss=metrics["lm_loss"],
+        )
+        new_finished = jnp.logical_or(finished, all_finish)
+        return carry, new_agg, steps + 1, new_finished, rng
+
+    init_state = (
+        carry,
+        _zero_eval_state(),
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(False),
+        rng,
+    )
+
+    _, aggregates, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
+    return aggregates
+
+
+@eqx.filter_jit
+def _rollout_state_histories(
+    model: Model,
+    carry: Carry,
+    rng: jnp.ndarray,
+) -> tuple[Carry, jnp.ndarray, jnp.ndarray]:
+    num_steps = int(model.config.halt_max_steps)
+
+    def step_fn(state, rng_step):
+        cur_carry = state
+        new_carry, outputs = model(cur_carry, rng=rng_step, training=False, record=True)
+        return new_carry, (
+            outputs["y_hist"],
+            outputs["z_hist"],
+        )
+
+    rngs = jax.random.split(rng, num_steps)
+    final_carry, (y_histories, z_histories) = jax.lax.scan(step_fn, carry, xs=rngs)
+    return final_carry, y_histories, z_histories
+
+
+def _render_logit_lens_frames(
+    y_tokens: np.ndarray,
+    z_tokens: np.ndarray,
+    sample_inputs: np.ndarray,
+    sample_outputs: np.ndarray,
+    palette: np.ndarray,
+    grid_size: int,
+) -> np.ndarray:
+    frames: List[np.ndarray] = []
+
+    num_iters = y_tokens.shape[0]
+    y_cycles = y_tokens.shape[1]
+    z_cycles = z_tokens.shape[2] if z_tokens.ndim >= 3 else 0
+
+    input_panel = _render_panel(
+        _safe_tokens(sample_inputs), palette, grid_size, "Input"
+    )
+    output_tokens = _safe_tokens(sample_outputs)
+    output_panel = _render_panel(output_tokens, palette, grid_size, "Output")
+    blank_tokens = np.zeros_like(sample_inputs)
+
+    for iter_idx in range(num_iters):
+        for y_idx in range(y_cycles):
+            y_panel = _render_panel(
+                _safe_tokens(y_tokens[iter_idx, y_idx]),
+                palette,
+                grid_size,
+                f"y={y_idx}",
+            )
+            inner_cycles = max(z_cycles, 1)
+
+            for z_idx in range(inner_cycles):
+                if z_cycles == 0:
+                    z_panel = _render_panel(
+                        blank_tokens,
+                        palette,
+                        grid_size,
+                        "z",
+                    )
+                else:
+                    z_panel = _render_panel(
+                        _safe_tokens(z_tokens[iter_idx, y_idx, z_idx]),
+                        palette,
+                        grid_size,
+                        f"z={z_idx}",
+                    )
+                frame = _grid_from_panels(
+                    y_panel,
+                    z_panel,
+                    input_panel,
+                    output_panel,
+                    banner=f"iter={iter_idx}",
+                )
+                frames.append(_pil_to_chw(frame))
+
+    return np.stack(frames, axis=0).astype(np.uint8)
+
+
+def _zero_eval_state(dtype=jnp.float32) -> EvalState:
+    zero = jnp.array(0.0, dtype=dtype)
+    return EvalState(zero, zero, zero, zero, zero)
 
 
 def _build_logit_lens_palette() -> np.ndarray:
@@ -227,148 +340,3 @@ def _safe_tokens(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
     arr = np.where(arr < 0, 0, arr)
     return arr
-
-
-def _render_logit_lens_frames(
-    y_tokens: np.ndarray,
-    z_tokens: np.ndarray,
-    sample_inputs: np.ndarray,
-    sample_outputs: np.ndarray | None,
-    palette: np.ndarray,
-    grid_size: int,
-) -> np.ndarray:
-    frames: List[np.ndarray] = []
-
-    num_iters = y_tokens.shape[0]
-    y_cycles = y_tokens.shape[1]
-    z_cycles = z_tokens.shape[2] if z_tokens.ndim >= 3 else 0
-    input_panel = _render_panel(
-        _safe_tokens(sample_inputs), palette, grid_size, "Input"
-    )
-    output_tokens = (
-        _safe_tokens(sample_outputs)
-        if sample_outputs is not None
-        else _safe_tokens(sample_inputs)
-    )
-    output_title = "Output" if sample_outputs is not None else "Input"
-    output_panel = _render_panel(output_tokens, palette, grid_size, output_title)
-    blank_tokens = np.zeros_like(sample_inputs)
-
-    for iter_idx in range(num_iters):
-        for y_idx in range(y_cycles):
-            y_panel = _render_panel(
-                _safe_tokens(y_tokens[iter_idx, y_idx]),
-                palette,
-                grid_size,
-                f"y={y_idx}",
-            )
-            inner_cycles = max(z_cycles, 1)
-
-            for z_idx in range(inner_cycles):
-                if z_cycles == 0:
-                    z_panel = _render_panel(
-                        blank_tokens,
-                        palette,
-                        grid_size,
-                        "z",
-                    )
-                else:
-                    z_panel = _render_panel(
-                        _safe_tokens(z_tokens[iter_idx, y_idx, z_idx]),
-                        palette,
-                        grid_size,
-                        f"z={z_idx}",
-                    )
-                frame = _grid_from_panels(
-                    y_panel,
-                    z_panel,
-                    input_panel,
-                    output_panel,
-                    banner=f"iter={iter_idx}",
-                )
-                frames.append(_pil_to_chw(frame))
-
-    return np.stack(frames, axis=0).astype(np.uint8)
-
-
-@eqx.filter_jit
-def _rollout_state_histories(
-    model: Model,
-    carry: Carry,
-    rng: jnp.ndarray,
-) -> tuple[Carry, jnp.ndarray, jnp.ndarray]:
-    num_steps = max(int(model.config.halt_max_steps), 1)
-
-    def step_fn(state, _):
-        cur_carry, cur_rng = state
-        cur_rng, step_rng = jax.random.split(cur_rng)
-        new_carry, outputs = model(
-            cur_carry,
-            rng=step_rng,
-            training=False,
-            record=True,
-        )
-        return (new_carry, cur_rng), (
-            outputs["y_states"],
-            outputs["z_states"],
-        )
-
-    (final_carry, _), (y_histories, z_histories) = jax.lax.scan(
-        step_fn,
-        (carry, rng),
-        xs=None,
-        length=num_steps,
-    )
-    return final_carry, y_histories, z_histories
-
-
-def evaluate_logit_lens(
-    model: Model,
-    batch: Dict[str, jnp.ndarray],
-    metadata: PuzzleDatasetMetadata,
-    filter_carry_fn,
-    *,
-    step: int,
-    rng: jnp.ndarray,
-):
-    if batch["inputs"].shape[0] == 0:
-        return
-
-    single = {
-        k: v[:1]
-        for k, v in batch.items()
-        if k in ("inputs", "labels", "puzzle_identifiers")
-    }
-    carry = model.initial_carry(single)
-    carry = filter_carry_fn(model, carry, single)
-    _, y_hidden, z_hidden = _rollout_state_histories(model, carry, rng)
-
-    palette = _build_logit_lens_palette()
-    grid_size = int(round(math.sqrt(metadata.seq_len)))
-
-    y_tokens = _hidden_to_tokens(y_hidden, model.lm_head, model.task_emb_len)
-    z_tokens = _hidden_to_tokens(z_hidden, model.lm_head, model.task_emb_len)
-
-    y_tokens_np = np.take(np.asarray(jax.device_get(y_tokens)), 0, axis=2)
-    z_tokens_np = np.take(np.asarray(jax.device_get(z_tokens)), 0, axis=3)
-
-    sample_inputs = np.asarray(jax.device_get(single["inputs"][0]))
-    sample_labels = (
-        np.asarray(jax.device_get(single["labels"][0])) if "labels" in single else None
-    )
-
-    frames = _render_logit_lens_frames(
-        y_tokens_np,
-        z_tokens_np,
-        sample_inputs,
-        sample_labels,
-        palette,
-        grid_size,
-    )
-    if frames.size == 0:
-        return
-
-    wandb.log(
-        {"logit_lens/video": wandb.Video(frames, format="mp4", fps=4)},
-        step=step,
-    )

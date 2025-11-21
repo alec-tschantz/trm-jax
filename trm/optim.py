@@ -15,6 +15,32 @@ class SparseSignSGDState(NamedTuple):
     pass
 
 
+def cosine_warmup_schedule(
+    current_step: int,
+    *,
+    base_lr: float,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_ratio: float = 0.0,
+    num_cycles: float = 0.5,
+):
+    if current_step < num_warmup_steps:
+        return base_lr * float(current_step) / float(max(1, num_warmup_steps))
+
+    progress = float(current_step - num_warmup_steps) / float(
+        max(1, num_training_steps - num_warmup_steps)
+    )
+    return base_lr * (
+        min_ratio
+        + max(
+            0.0,
+            (1 - min_ratio)
+            * 0.5
+            * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
+        )
+    )
+
+
 def adam_atan2(
     *,
     beta1: float = 0.9,
