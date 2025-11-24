@@ -434,16 +434,21 @@ def main(config: TrainConfig = TrainConfig()):
             metric_values = {k: float(v) for k, v in metrics.items()}
             count = metric_values.get("count", 1.0)
             logged = {
-                "train/loss": float(loss),
-                "train/lm_loss": metric_values.get("lm_loss", 0.0) / count,
-                "train/q_halt_loss": metric_values.get("q_halt_loss", 0.0) / count,
-                "train/info_nce_loss": metric_values.get("encoder/info_nce_loss", 0.0),
-                "train/pos_sim": metric_values.get("encoder/pos_sim", 0.0),
-                "train/top1_i2t": metric_values.get("encoder/top1_i2t", 0.0),
-                "train/top1_t2i": metric_values.get("encoder/top1_t2i", 0.0),
                 "train/lr": float(lr_main),
                 "train/encoder_lr": float(lr_encoder),
             }
+            safe_count = max(count, 1.0)
+
+            for k, v in metric_values.items():
+                name = f"train/{k}"
+                if k.endswith("loss") and not k.startswith("encoder/"):
+                    logged[name] = v / safe_count
+                elif k in ("accuracy", "exact_accuracy", "q_halt_accuracy"):
+                    logged[name] = v / safe_count
+                else:
+                    logged[name] = v
+
+            logged["train/loss"] = float(loss)
             wandb.log(logged, step=train_state.step)
 
         if config.viz_every > 0 and train_state.step % config.viz_every == 0:
