@@ -15,6 +15,7 @@ def act_loss(
     rng: jnp.ndarray,
     *,
     training: bool,
+    task_emb: jnp.ndarray,
 ) -> Tuple[
     Carry, jnp.ndarray, Dict[str, jnp.ndarray], Dict[str, jnp.ndarray], jnp.ndarray
 ]:
@@ -23,6 +24,7 @@ def act_loss(
         rng=rng,
         training=training,
         record=False,
+        task_emb=task_emb,
     )
 
     labels = new_carry.data["labels"]
@@ -94,4 +96,49 @@ def stablemax_cross_entropy(
     return -jnp.where(valid_mask, pred_logprobs.squeeze(-1), 0.0)
 
 
+def info_nce_loss(
+    z1: jnp.ndarray,
+    z2: jnp.ndarray,
+    *,
+    temperature: float,
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+    """Symmetric InfoNCE loss for two batches of embeddings."""
+    z1_norm = _l2_normalize(z1)
+    z2_norm = _l2_normalize(z2)
 
+    logits = jnp.matmul(z1_norm, jnp.transpose(z2_norm, (1, 0))) / temperature
+    labels = jnp.arange(logits.shape[0], dtype=jnp.int32)
+
+    loss12 = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    loss21 = optax.softmax_cross_entropy_with_integer_labels(
+        jnp.transpose(logits, (1, 0)), labels
+    )
+    loss = 0.5 * (jnp.mean(loss12) + jnp.mean(loss21))
+
+    diag = jnp.sum(z1_norm * z2_norm, axis=-1)
+    off_diag = jnp.where(jnp.eye(logits.shape[0], dtype=bool), -1e9, logits)
+
+    metrics: Dict[str, jnp.ndarray] = {
+        "info_nce_loss": loss,
+        "pos_sim": jnp.mean(diag),
+        "logits_std": jnp.std(logits),
+        "top1_i2t": jnp.mean(
+            (jnp.argmax(logits, axis=1) == labels).astype(jnp.float32)
+        ),
+        "top1_t2i": jnp.mean(
+            (jnp.argmax(logits, axis=0) == labels).astype(jnp.float32)
+        ),
+        "max_neg_logit": jnp.max(off_diag),
+        "mean_norm": jnp.mean(
+            jnp.concatenate(
+                [jnp.linalg.norm(z1, axis=-1), jnp.linalg.norm(z2, axis=-1)]
+            )
+        ),
+    }
+    return loss, metrics
+
+
+def _l2_normalize(x: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    denom = jnp.linalg.norm(x, axis=-1, keepdims=True)
+    denom = jnp.maximum(denom, eps)
+    return x / denom

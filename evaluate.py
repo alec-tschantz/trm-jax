@@ -1,14 +1,12 @@
 import math
-from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import wandb
-from torch.utils.data import DataLoader
 
 from dataset import DatasetMetadata
 from trm.losses import act_loss
@@ -35,6 +33,126 @@ LOGIT_LENS_TITLE_BG = (242, 242, 242)
 LOGIT_LENS_TEXT_COLOR = (0, 0, 0)
 
 LOGIT_LENS_FONT = ImageFont.load_default()
+NN_PANEL_SIZE = 160
+NN_TITLE_HEIGHT = 20
+NN_ROW_BANNER_HEIGHT = 26
+NN_ROW_BG = (245, 245, 245)
+
+
+def render_nearest_neighbors(
+    encoder,
+    batch_np: Dict[str, np.ndarray],
+    metadata: DatasetMetadata,
+    *,
+    top_k: int,
+) -> Image.Image:
+    flat_inputs, flat_labels, embeddings = _encode_examples_np(encoder, batch_np)
+    if embeddings.shape[0] <= 1:
+        return Image.new("RGB", (NN_PANEL_SIZE * 2, NN_PANEL_SIZE), NN_ROW_BG)
+
+    norms = np.linalg.norm(embeddings, axis=-1)
+    norms = np.maximum(norms, 1e-8)
+    query = embeddings[0]
+    sims = (embeddings @ query) / (norms * max(np.linalg.norm(query), 1e-8))
+    order = np.argsort(-sims)
+    neighbors = [idx for idx in order if idx != 0][:top_k]
+    selected = [0] + neighbors
+
+    palette = _build_logit_lens_palette()
+    grid_size = int(round(math.sqrt(metadata.seq_len)))
+
+    rows = []
+    for rank, idx in enumerate(selected):
+        header = "query" if rank == 0 else f"nn {rank}  sim={sims[idx]:.3f}"
+        row = _render_nn_pair_row(
+            flat_inputs[idx],
+            flat_labels[idx],
+            header,
+            palette,
+            grid_size,
+        )
+        rows.append(row)
+
+    width = max(row.width for row in rows)
+    height = sum(row.height for row in rows) + 8 * (len(rows) - 1)
+    canvas = Image.new("RGB", (width, height), NN_ROW_BG)
+    y = 0
+    for i, row in enumerate(rows):
+        canvas.paste(row, (0, y))
+        y += row.height + (8 if i + 1 < len(rows) else 0)
+    return canvas
+
+
+def _encode_examples_np(
+    encoder, batch_np: Dict[str, np.ndarray]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    seq_len = batch_np["inputs_1"].shape[-1]
+    flat_inputs = np.concatenate(
+        [batch_np["inputs_1"], batch_np["inputs_2"]], axis=0
+    ).reshape(-1, seq_len)
+    flat_labels = np.concatenate(
+        [batch_np["labels_1"], batch_np["labels_2"]], axis=0
+    ).reshape(-1, seq_len)
+
+    embeddings = encoder.encode_examples(
+        jnp.asarray(flat_inputs), jnp.asarray(flat_labels)
+    )
+    embeddings = np.asarray(jax.device_get(embeddings))
+    return flat_inputs, flat_labels, embeddings
+
+
+def _render_nn_pair_row(
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    header: str,
+    palette: np.ndarray,
+    grid_size: int,
+) -> Image.Image:
+    input_panel = _render_nn_panel(inputs, palette, grid_size, "Input")
+    label_panel = _render_nn_panel(labels, palette, grid_size, "Output")
+
+    width = input_panel.width + label_panel.width
+    height = NN_ROW_BANNER_HEIGHT + input_panel.height
+    row = Image.new("RGB", (width, height), NN_ROW_BG)
+    row.paste(input_panel, (0, NN_ROW_BANNER_HEIGHT))
+    row.paste(label_panel, (input_panel.width, NN_ROW_BANNER_HEIGHT))
+
+    draw = ImageDraw.Draw(row)
+    draw.text(
+        (width // 2, NN_ROW_BANNER_HEIGHT // 2),
+        header,
+        font=LOGIT_LENS_FONT,
+        fill=(0, 0, 0),
+        anchor="mm",
+    )
+    return row
+
+
+def _render_nn_panel(
+    tokens: np.ndarray, palette: np.ndarray, grid_size: int, title: str
+) -> Image.Image:
+    safe = np.where(tokens < 0, 0, tokens)
+    flat = safe[: grid_size * grid_size]
+    if flat.size < grid_size * grid_size:
+        flat = np.pad(flat, (0, grid_size * grid_size - flat.size), constant_values=0)
+
+    colors = palette[np.mod(flat.reshape(grid_size, grid_size), palette.shape[0])]
+    img = Image.fromarray(colors.astype(np.uint8), mode="RGB")
+    img = img.resize((NN_PANEL_SIZE, NN_PANEL_SIZE), Image.NEAREST)
+
+    panel = Image.new(
+        "RGB", (NN_PANEL_SIZE, NN_PANEL_SIZE + NN_TITLE_HEIGHT), (255, 255, 255)
+    )
+    panel.paste(img, (0, NN_TITLE_HEIGHT))
+    draw = ImageDraw.Draw(panel)
+    draw.text(
+        (NN_PANEL_SIZE // 2, NN_TITLE_HEIGHT // 2),
+        title,
+        font=LOGIT_LENS_FONT,
+        fill=(0, 0, 0),
+        anchor="mm",
+    )
+    return panel
 
 
 class EvalState(NamedTuple):
@@ -45,67 +163,25 @@ class EvalState(NamedTuple):
     lm_loss: jnp.ndarray
 
 
-def evaluate_model(
-    model: Model,
-    dataloader: DataLoader,
-    *,
-    batch_converter: Callable[[Dict[str, Any]], Dict[str, jnp.ndarray]],
-    filter_carry_fn: Callable[[Model, Carry, Dict[str, jnp.ndarray]], Carry],
-    rng: jnp.ndarray,
-) -> Dict[str, float]:
-    totals = {
-        "lm_loss": 0.0,
-        "accuracy": 0.0,
-        "exact_accuracy": 0.0,
-        "q_halt_accuracy": 0.0,
-        "count": 0.0,
-        "loss_denominator": 0.0,
-    }
-    max_steps = model.config.halt_max_steps
-
-    for _, batch, global_batch_size in dataloader:
-        batch_jnp = batch_converter(batch)
-        carry = model.initial_carry(batch_jnp)
-        carry = filter_carry_fn(model, carry, batch_jnp)
-
-        rng, rollout_rng = jax.random.split(rng)
-        aggregates = _eval_rollout(model, carry, max_steps, rollout_rng)
-        aggregates = jtu.tree_map(lambda x: float(x), aggregates)
-        totals["accuracy"] += aggregates.accuracy
-        totals["exact_accuracy"] += aggregates.exact_accuracy
-        totals["q_halt_accuracy"] += aggregates.q_halt_accuracy
-        totals["count"] += aggregates.count
-        totals["lm_loss"] += aggregates.lm_loss
-        totals["loss_denominator"] += float(global_batch_size)
-
-    results = {}
-    if totals["loss_denominator"] > 0:
-        results["test/lm_loss"] = totals["lm_loss"] / totals["loss_denominator"]
-    if totals["count"] > 0:
-        denom = max(totals["count"], 1e-8)
-        results["test/accuracy"] = totals["accuracy"] / denom
-        results["test/exact_accuracy"] = totals["exact_accuracy"] / denom
-        results["test/q_halt_accuracy"] = totals["q_halt_accuracy"] / denom
-    return results
-
-
 def evaluate_logit_lens(
     model: Model,
     batch: Dict[str, jnp.ndarray],
     metadata: DatasetMetadata,
-    filter_carry_fn,
     *,
     step: int,
     rng: jnp.ndarray,
+    task_emb: jnp.ndarray | None = None,
 ):
     single = {
         k: v[:1]
         for k, v in batch.items()
         if k in ("inputs", "labels", "puzzle_identifiers")
     }
+    task_emb_single = task_emb[:1] if task_emb is not None else None
     carry = model.initial_carry(single)
-    carry = filter_carry_fn(model, carry, single)
-    _, y_hidden, z_hidden = _rollout_state_histories(model, carry, rng)
+    _, y_hidden, z_hidden = _rollout_state_histories(
+        model, carry, rng, task_emb_single
+    )
 
     palette = _build_logit_lens_palette()
     grid_size = int(round(math.sqrt(metadata.seq_len)))
@@ -136,7 +212,11 @@ def evaluate_logit_lens(
 
 @eqx.filter_jit
 def _eval_rollout(
-    model: Model, carry: Carry, max_steps: int, rng: jnp.ndarray
+    model: Model,
+    carry: Carry,
+    max_steps: int,
+    rng: jnp.ndarray,
+    task_emb: jnp.ndarray,
 ) -> EvalState:
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
 
@@ -148,7 +228,7 @@ def _eval_rollout(
         carry, agg, steps, finished, rng = state
         rng, step_rng = jax.random.split(rng)
         carry, _loss, metrics, all_finish = act_loss(
-            model, carry, rng=step_rng, training=False
+            model, carry, rng=step_rng, training=False, task_emb=task_emb
         )
         new_agg = EvalState(
             accuracy=agg.accuracy + metrics["accuracy"],
@@ -177,12 +257,19 @@ def _rollout_state_histories(
     model: Model,
     carry: Carry,
     rng: jnp.ndarray,
+    task_emb: jnp.ndarray | None = None,
 ) -> tuple[Carry, jnp.ndarray, jnp.ndarray]:
     num_steps = int(model.config.halt_max_steps)
 
     def step_fn(state, rng_step):
         cur_carry = state
-        new_carry, outputs = model(cur_carry, rng=rng_step, training=False, record=True)
+        new_carry, outputs = model(
+            cur_carry,
+            rng=rng_step,
+            training=False,
+            record=True,
+            task_emb=task_emb,
+        )
         return new_carry, (
             outputs["y_hist"],
             outputs["z_hist"],

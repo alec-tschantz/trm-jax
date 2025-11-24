@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -11,37 +10,13 @@ import torch
 import tyro
 import tqdm
 import wandb
-from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
 
-from dataset.dataset import (
-    DatasetConfig,
-    DatasetMetadata,
-    GroupDataset,
-)
-from trm.encoder import DEFAULT_IGNORE_LABEL_ID, Encoder, EncoderConfig, info_nce_loss
+from dataset.dataset import DatasetConfig, DatasetMetadata, GroupDataset
+from evaluate import render_nearest_neighbors
+from trm.encoder import DEFAULT_IGNORE_LABEL_ID, Encoder, EncoderConfig
+from trm.losses import info_nce_loss
 from trm.optim import cosine_warmup_schedule
-
-LOGIT_LENS_COLORS = [
-    (25, 25, 25),
-    (242, 242, 242),
-    (52, 168, 83),
-    (234, 67, 53),
-    (30, 136, 229),
-    (249, 168, 37),
-    (171, 71, 188),
-    (0, 172, 193),
-    (255, 109, 132),
-    (123, 31, 162),
-    (255, 214, 0),
-    (0, 137, 123),
-]
-
-FONT = ImageFont.load_default()
-PANEL_SIZE = 160
-PANEL_TITLE_HEIGHT = 20
-ROW_BANNER_HEIGHT = 26
-ROW_BG = (245, 245, 245)
 
 
 @dataclass
@@ -198,121 +173,6 @@ def compute_lr(config: TrainEncoderConfig, step: int, total_steps: int):
     return jnp.array(lr, dtype=jnp.float32)
 
 
-def render_nearest_neighbors(
-    model: Encoder,
-    batch_np: Dict[str, np.ndarray],
-    metadata: DatasetMetadata,
-    *,
-    top_k: int,
-) -> Image.Image:
-    flat_inputs, flat_labels, embeddings = _encode_examples_np(model, batch_np)
-    if embeddings.shape[0] <= 1:
-        return Image.new("RGB", (PANEL_SIZE * 2, PANEL_SIZE), ROW_BG)
-
-    norms = np.linalg.norm(embeddings, axis=-1)
-    norms = np.maximum(norms, 1e-8)
-    query = embeddings[0]
-    query_norm = max(np.linalg.norm(query), 1e-8)
-    sims = (embeddings @ query) / (norms * query_norm)
-    order = np.argsort(-sims)
-    neighbors = [idx for idx in order if idx != 0][:top_k]
-    selected = [0] + neighbors
-
-    palette = np.asarray(LOGIT_LENS_COLORS, dtype=np.uint8)
-    grid_size = int(round(math.sqrt(metadata.seq_len)))
-
-    rows = []
-    for rank, idx in enumerate(selected):
-        header = "query" if rank == 0 else f"nn {rank}  sim={sims[idx]:.3f}"
-        row = _render_pair_row(
-            flat_inputs[idx],
-            flat_labels[idx],
-            header,
-            palette,
-            grid_size,
-        )
-        rows.append(row)
-
-    width = max(row.width for row in rows)
-    height = sum(row.height for row in rows) + 8 * (len(rows) - 1)
-    canvas = Image.new("RGB", (width, height), ROW_BG)
-    y = 0
-    for i, row in enumerate(rows):
-        canvas.paste(row, (0, y))
-        y += row.height + (8 if i + 1 < len(rows) else 0)
-    return canvas
-
-
-def _encode_examples_np(
-    model: Encoder, batch_np: Dict[str, np.ndarray]
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    seq_len = batch_np["inputs_1"].shape[-1]
-    flat_inputs = np.concatenate(
-        [batch_np["inputs_1"], batch_np["inputs_2"]], axis=0
-    ).reshape(-1, seq_len)
-    flat_labels = np.concatenate(
-        [batch_np["labels_1"], batch_np["labels_2"]], axis=0
-    ).reshape(-1, seq_len)
-
-    embeddings = model.encode_examples(
-        jnp.asarray(flat_inputs), jnp.asarray(flat_labels)
-    )
-    embeddings = np.asarray(jax.device_get(embeddings))
-    return flat_inputs, flat_labels, embeddings
-
-
-def _render_pair_row(
-    inputs: np.ndarray,
-    labels: np.ndarray,
-    header: str,
-    palette: np.ndarray,
-    grid_size: int,
-) -> Image.Image:
-    input_panel = _render_panel(inputs, palette, grid_size, "Input")
-    label_panel = _render_panel(labels, palette, grid_size, "Output")
-
-    width = input_panel.width + label_panel.width
-    height = ROW_BANNER_HEIGHT + input_panel.height
-    row = Image.new("RGB", (width, height), ROW_BG)
-    row.paste(input_panel, (0, ROW_BANNER_HEIGHT))
-    row.paste(label_panel, (input_panel.width, ROW_BANNER_HEIGHT))
-
-    draw = ImageDraw.Draw(row)
-    draw.text(
-        (width // 2, ROW_BANNER_HEIGHT // 2),
-        header,
-        font=FONT,
-        fill=(0, 0, 0),
-        anchor="mm",
-    )
-    return row
-
-
-def _render_panel(
-    tokens: np.ndarray, palette: np.ndarray, grid_size: int, title: str
-) -> Image.Image:
-    safe = np.where(tokens < 0, 0, tokens)
-    flat = safe[: grid_size * grid_size]
-    if flat.size < grid_size * grid_size:
-        flat = np.pad(flat, (0, grid_size * grid_size - flat.size), constant_values=0)
-
-    colors = palette[np.mod(flat.reshape(grid_size, grid_size), palette.shape[0])]
-    img = Image.fromarray(colors.astype(np.uint8), mode="RGB")
-    img = img.resize((PANEL_SIZE, PANEL_SIZE), Image.NEAREST)
-
-    panel = Image.new(
-        "RGB", (PANEL_SIZE, PANEL_SIZE + PANEL_TITLE_HEIGHT), (255, 255, 255)
-    )
-    panel.paste(img, (0, PANEL_TITLE_HEIGHT))
-    draw = ImageDraw.Draw(panel)
-    draw.text(
-        (PANEL_SIZE // 2, PANEL_TITLE_HEIGHT // 2),
-        title,
-        font=FONT,
-        fill=(0, 0, 0),
-        anchor="mm",
-    )
-    return panel
 
 
 def main(config: TrainEncoderConfig = TrainEncoderConfig()):

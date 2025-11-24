@@ -1,11 +1,9 @@
-import math
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Tuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 import optax
 import torch
 import tyro
@@ -13,34 +11,39 @@ import tqdm
 import wandb
 from torch.utils.data import DataLoader
 
-from dataset import Dataset, DatasetConfig, DatasetMetadata
-from evaluate import evaluate_model, evaluate_logit_lens
-from trm.losses import act_loss
+from dataset.dataset import DatasetConfig, DatasetMetadata, GroupDataset
+from evaluate import evaluate_logit_lens, render_nearest_neighbors
+from trm.encoder import DEFAULT_IGNORE_LABEL_ID, Encoder, EncoderConfig
+from trm.losses import act_loss, info_nce_loss
 from trm.model import Carry, Model, ModelConfig
-from trm.optim import adam_atan2, sparse_sign_sgd, cosine_warmup_schedule
+from trm.optim import adam_atan2, cosine_warmup_schedule
 from trm.utils import EMAHelper
 
 
 @dataclass
 class TrainConfig:
-    data_path: str = "data/maze-30x30-hard-1k"
-    global_batch_size: int = 192
+    data_path: str = "data/arc1concept-aug-1000"
+    global_group_batch_size: int = 64
+    examples_per_view: int = 4
     epochs: int = 50000
     lr: float = 1e-4
-    lr_min_ratio: float = 1.0
+    encoder_lr: float = 3e-4
+    lr_min_ratio: float = 0.1
     lr_warmup_steps: int = 2000
-    weight_decay: float = 1.0
+    weight_decay: float = 1e-4
+    encoder_weight_decay: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.95
-    task_emb_lr: float = 1e-4
-    task_emb_weight_decay: float = 1.0
     grad_clip_norm: float = 1.0
     project_name: str = "trm-arc"
-    run_name: str = "trm-maze"
+    run_name: str = "trm-encoder"
     seed: int = 0
     ema_rate: float = 0.999
-    eval_every: int = 1000
+    log_every: int = 10
     logit_lens_every: int = 200
+    viz_every: int = 200
+    viz_neighbors: int = 6
+    temperature: float = 0.1
     halt_exploration_prob: float = 0.1
     halt_max_steps: int = 16
     y_cycles: int = 3
@@ -49,9 +52,16 @@ class TrainConfig:
     hidden_size: int = 512
     num_heads: int = 8
     expansion: int = 4
-    task_emb_ndim: int = 512
     forward_dtype: str = "bfloat16"
-    task_emb_len: int = 16
+    task_emb_len: int = 1
+
+    # Encoder
+    encoder_hidden_size: int = 512
+    encoder_num_layers: int = 4
+    encoder_num_heads: int = 8
+    encoder_expansion: float = 4.0
+    encoder_proj_dim: int = 512
+    encoder_rms_norm_eps: float = 1e-5
 
 
 @dataclass
@@ -59,6 +69,9 @@ class TrainState:
     params: eqx.Module
     static: eqx.Module
     opt_state: optax.OptState
+    encoder_params: eqx.Module
+    encoder_static: eqx.Module
+    encoder_opt_state: optax.OptState
     carry: Carry | None
     step: int
     total_steps: int
@@ -71,11 +84,10 @@ def create_model(
     *,
     key: jnp.ndarray,
 ):
+    batch_size = config.global_group_batch_size * config.examples_per_view
     model_cfg = ModelConfig(
-        batch_size=config.global_batch_size,
+        batch_size=batch_size,
         seq_len=train_metadata.seq_len,
-        task_emb_ndim=config.task_emb_ndim,
-        num_task_identifiers=train_metadata.num_puzzle_identifiers,
         vocab_size=train_metadata.vocab_size,
         y_cycles=config.y_cycles,
         z_cycles=config.z_cycles,
@@ -92,25 +104,34 @@ def create_model(
     model = Model(model_cfg, key=key)
     params, static = eqx.partition(model, eqx.is_array)
 
-    def build_param_labels(p):
-        labels = jtu.tree_map(lambda _: 0, p)
-        labels = eqx.tree_at(lambda tree: tree.task_embed.weight, labels, 1)
-        return labels
-
-    param_labels = build_param_labels(params)
-
-    transforms = {
-        0: adam_atan2(
-            beta1=config.beta1,
-            beta2=config.beta2,
-            weight_decay=config.weight_decay,
-        ),
-        1: sparse_sign_sgd(weight_decay=config.task_emb_weight_decay),
-    }
-
-    optimizer = optax.multi_transform(transforms, build_param_labels)
+    optimizer = adam_atan2(
+        beta1=config.beta1,
+        beta2=config.beta2,
+        weight_decay=config.weight_decay,
+    )
     opt_state = optimizer.init(params)
-    return params, static, optimizer, opt_state, param_labels
+    return params, static, optimizer, opt_state
+
+
+def create_encoder(config: TrainConfig, metadata: DatasetMetadata, *, key: jnp.ndarray):
+    enc_config = EncoderConfig(
+        seq_len=metadata.seq_len,
+        vocab_size=metadata.vocab_size,
+        pad_id=metadata.pad_id,
+        ignore_label_id=metadata.ignore_label_id or DEFAULT_IGNORE_LABEL_ID,
+        hidden_size=config.encoder_hidden_size,
+        num_layers=config.encoder_num_layers,
+        num_heads=config.encoder_num_heads,
+        expansion=config.encoder_expansion,
+        proj_dim=config.encoder_proj_dim,
+        forward_dtype=config.forward_dtype,
+        rms_norm_eps=config.encoder_rms_norm_eps,
+    )
+    encoder = Encoder(enc_config, key=key)
+    params, static = eqx.partition(encoder, eqx.is_array)
+    optimizer = optax.adamw(learning_rate=1.0, weight_decay=config.encoder_weight_decay)
+    opt_state = optimizer.init(params)
+    return params, static, optimizer, opt_state
 
 
 def create_train_state(
@@ -118,42 +139,56 @@ def create_train_state(
     train_metadata: DatasetMetadata,
     *,
     model_key: jnp.ndarray,
+    encoder_key: jnp.ndarray,
     train_key: jnp.ndarray,
 ):
     total_steps = int(
-        config.epochs
-        * train_metadata.total_groups
-        * train_metadata.mean_puzzle_examples
-        / config.global_batch_size
+        config.epochs * train_metadata.total_groups / config.global_group_batch_size
     )
-    params, static, optimizer, opt_state, param_labels = create_model(
-        config, train_metadata, key=model_key
-    )
+    (
+        params,
+        static,
+        optimizer,
+        opt_state,
+    ) = create_model(config, train_metadata, key=model_key)
+    (
+        encoder_params,
+        encoder_static,
+        encoder_opt,
+        encoder_opt_state,
+    ) = create_encoder(config, train_metadata, key=encoder_key)
+
     return (
         TrainState(
             params=params,
             static=static,
             opt_state=opt_state,
+            encoder_params=encoder_params,
+            encoder_static=encoder_static,
+            encoder_opt_state=encoder_opt_state,
             carry=None,
             step=0,
             total_steps=total_steps,
             rng=train_key,
         ),
         optimizer,
-        param_labels,
+        encoder_opt,
     )
 
 
-def create_dataloader(config: TrainConfig, split: str, **kwargs):
-    dataset = Dataset(
+def create_dataloader(config: TrainConfig):
+    dataset = GroupDataset(
         DatasetConfig(
             seed=config.seed,
             dataset_paths=[config.data_path],
             rank=0,
             num_replicas=1,
-            **kwargs,
+            global_batch_size=config.global_group_batch_size,
+            epochs_per_iter=config.epochs,
+            test_set_mode=False,
         ),
-        split=split,
+        split="train",
+        examples_per_view=config.examples_per_view,
     )
     dataloader = DataLoader(
         dataset,
@@ -164,14 +199,12 @@ def create_dataloader(config: TrainConfig, split: str, **kwargs):
     return dataloader, dataset.metadata
 
 
-def infinite_dataloader(dataloader: DataLoader):
-    while True:
-        for batch in dataloader:
-            yield batch
-
-
 def batch_to_jnp(batch: Dict[str, torch.Tensor]) -> Dict[str, jnp.ndarray]:
     return {k: jnp.asarray(v.detach().cpu().numpy()) for k, v in batch.items()}
+
+
+def batch_to_np(batch: Dict[str, torch.Tensor]) -> Dict[str, jnp.ndarray]:
+    return {k: v.detach().cpu().numpy() for k, v in batch.items()}
 
 
 def compute_lr(base_lr: float, config: TrainConfig, train_state: TrainState):
@@ -205,159 +238,247 @@ def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> C
     )
 
 
-def make_train_step(static_model, optimizer, param_labels, clipper):
+def flatten_batch(
+    batch: Dict[str, jnp.ndarray]
+) -> Dict[str, jnp.ndarray]:
+    b, k, s = batch["inputs_1"].shape
+    flat_inputs1 = batch["inputs_1"].reshape(b * k, s)
+    flat_labels1 = batch["labels_1"].reshape(b * k, s)
+    flat_inputs2 = batch["inputs_2"].reshape(b * k, s)
+    flat_labels2 = batch["labels_2"].reshape(b * k, s)
+
+    flat_inputs = jnp.concatenate([flat_inputs1, flat_inputs2], axis=0)
+    flat_labels = jnp.concatenate([flat_labels1, flat_labels2], axis=0)
+
+    puzzle_ids = jnp.repeat(batch["group_ids"], 2 * k, axis=0)
+    return {
+        "inputs": flat_inputs,
+        "labels": flat_labels,
+        "puzzle_identifiers": puzzle_ids,
+    }
+
+
+def make_train_step(
+    static_model,
+    static_encoder,
+    model_optimizer,
+    encoder_optimizer,
+    clipper,
+    *,
+    examples_per_view: int,
+    temperature: float,
+):
     @eqx.filter_jit
     def train_step(
-        params, opt_state, carry, batch_data, global_batch_size, rng, lr_main, lr_task
+        params,
+        opt_state,
+        encoder_params,
+        encoder_opt_state,
+        carry,
+        batch,
+        rng,
+        lr_main,
+        lr_encoder,
     ):
-        gb = jnp.asarray(global_batch_size, dtype=jnp.float32)
-
-        def loss_fn(p):
+        def loss_fn(all_params):
+            p, ep = all_params
             model = eqx.combine(p, static_model)
-            inp_carry = filter_carry(model, carry, batch_data)
-            new_carry, loss, metrics, _ = act_loss(
-                model, inp_carry, rng=rng, training=True
-            )
-            return loss / gb, (new_carry, metrics, loss)
+            encoder = eqx.combine(ep, static_encoder)
 
-        (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
+            trm_batch = flatten_batch(batch)
+            effective_carry = filter_carry(model, carry, trm_batch)
+
+            gb_examples = jnp.asarray(trm_batch["inputs"].shape[0], dtype=jnp.float32)
+
+            flat_inputs = effective_carry.data["inputs"]
+            flat_labels = effective_carry.data["labels"]
+            z_trm = encoder.encode_examples(flat_inputs, flat_labels)
+            task_emb = jax.lax.stop_gradient(z_trm)[:, None, :]
+
+            new_carry, trm_loss, trm_metrics, _ = act_loss(
+                model, effective_carry, rng=rng, training=True, task_emb=task_emb
+            )
+
+            _, g1 = encoder.encode_views(batch["inputs_1"], batch["labels_1"])
+            _, g2 = encoder.encode_views(batch["inputs_2"], batch["labels_2"])
+
+            info_loss, info_metrics = info_nce_loss(g1, g2, temperature=temperature)
+
+            total_loss = trm_loss / gb_examples + info_loss
+
+            metrics = {
+                **trm_metrics,
+                "trm_loss": trm_loss,
+                **{f"encoder/{k}": v for k, v in info_metrics.items()},
+                "count": gb_examples,
+            }
+            aux = {
+                "carry": new_carry,
+                "trm_loss": trm_loss,
+                "info_loss": info_loss,
+                "metrics": metrics,
+            }
+            return total_loss, aux
+
+        (loss, aux), grads = eqx.filter_value_and_grad(
             loss_fn, has_aux=True
-        )(params)
+        )((params, encoder_params))
 
         grads, _ = clipper.update(grads, optax.EmptyState())
-        updates, opt_state = optimizer.update(grads, opt_state, params)
+        grads_model, grads_encoder = grads
 
-        def scale_update(update, label):
-            if update is None:
-                return None
-            lr = jnp.where(jnp.equal(label, 1), lr_task, lr_main)
-            return update * lr
-
-        updates = jax.tree.map(scale_update, updates, param_labels)
+        updates, opt_state = model_optimizer.update(grads_model, opt_state, params)
+        updates = jax.tree.map(
+            lambda u: u * lr_main if u is not None else None, updates
+        )
         params = optax.apply_updates(params, updates)
-        return params, opt_state, new_carry, unscaled_loss, metrics
+
+        enc_updates, encoder_opt_state = encoder_optimizer.update(
+            grads_encoder, encoder_opt_state, encoder_params
+        )
+        enc_updates = jax.tree.map(
+            lambda u: u * lr_encoder if u is not None else None, enc_updates
+        )
+        encoder_params = optax.apply_updates(encoder_params, enc_updates)
+
+        return (
+            params,
+            opt_state,
+            encoder_params,
+            encoder_opt_state,
+            aux["carry"],
+            loss,
+            aux["metrics"],
+        )
 
     return train_step
 
 
 def main(config: TrainConfig = TrainConfig()):
     torch.random.manual_seed(config.seed)
-
-    train_loader, train_metadata = create_dataloader(
-        config,
-        "train",
-        test_set_mode=False,
-        epochs_per_iter=config.epochs,
-        global_batch_size=config.global_batch_size,
-    )
-    test_loader, test_metadata = create_dataloader(
-        config,
-        "test",
-        test_set_mode=True,
-        epochs_per_iter=1,
-        global_batch_size=config.global_batch_size,
-    )
-
-    test_loader_iter = infinite_dataloader(test_loader)
+    train_loader, metadata = create_dataloader(config)
 
     rng = jax.random.PRNGKey(config.seed)
-    rngs = jax.random.split(rng, 5)
-    rng, model_key, train_key, eval_rng, logit_lens_rng = rngs
+    rngs = jax.random.split(rng, 4)
+    rng, model_key, encoder_key, train_key = rngs
 
-    train_state, optimizer, param_labels = create_train_state(
-        config, train_metadata, model_key=model_key, train_key=train_key
+    train_state, optimizer, encoder_opt = create_train_state(
+        config, metadata, model_key=model_key, encoder_key=encoder_key, train_key=train_key
     )
 
-    progress_bar = tqdm.tqdm(total=train_state.total_steps)
+    ema_helper = EMAHelper(mu=config.ema_rate)
+    ema_helper.register(eqx.combine(train_state.params, train_state.static))
+
+    clipper = optax.clip_by_global_norm(config.grad_clip_norm)
+    train_step = make_train_step(
+        train_state.static,
+        train_state.encoder_static,
+        optimizer,
+        encoder_opt,
+        clipper,
+        examples_per_view=config.examples_per_view,
+        temperature=config.temperature,
+    )
+
     wandb.init(
         project=config.project_name,
         name=config.run_name,
         config=config.__dict__,
         settings=wandb.Settings(_disable_stats=True),
     )
+    progress_bar = tqdm.tqdm(total=train_state.total_steps)
 
-    ema_helper = EMAHelper(mu=config.ema_rate)
-    ema_helper.register(eqx.combine(train_state.params, train_state.static))
-    clipper = optax.clip_by_global_norm(config.grad_clip_norm)
-
-    train_step = make_train_step(train_state.static, optimizer, param_labels, clipper)
-
-    for _, batch, global_batch_size in train_loader:
+    for _, batch, _ in train_loader:
         if train_state.step >= train_state.total_steps:
             break
 
         batch_jnp = batch_to_jnp(batch)
 
         if train_state.carry is None:
-            model = eqx.combine(train_state.params, train_state.static)
-            train_state.carry = model.initial_carry(batch_jnp)
+            model_for_carry = eqx.combine(train_state.params, train_state.static)
+            trm_batch = flatten_batch(batch_jnp)
+            train_state.carry = model_for_carry.initial_carry(trm_batch)
 
         lr_main = compute_lr(config.lr, config, train_state)
-        lr_task = compute_lr(config.task_emb_lr, config, train_state)
+        lr_encoder = compute_lr(config.encoder_lr, config, train_state)
+
         rng, step_rng = jax.random.split(train_state.rng)
 
         (
-            new_params,
+            train_state.params,
             train_state.opt_state,
-            train_state.carry,
+            train_state.encoder_params,
+            train_state.encoder_opt_state,
+            new_carry,
             loss,
             metrics,
         ) = train_step(
             train_state.params,
             train_state.opt_state,
+            train_state.encoder_params,
+            train_state.encoder_opt_state,
             train_state.carry,
             batch_jnp,
-            jnp.asarray(global_batch_size, dtype=jnp.float32),
             step_rng,
             lr_main,
-            lr_task,
+            lr_encoder,
         )
-        train_state.params = new_params
+
         train_state.step += 1
         train_state.rng = rng
-
+        train_state.carry = new_carry
         ema_helper.update(eqx.combine(train_state.params, train_state.static))
+        progress_bar.update(train_state.step - progress_bar.n)
 
-        metric_values = {k: float(v) for k, v in metrics.items()}
-        if len(metric_values):
-            count = max(metric_values.get("count", 1.0), 1.0)
+        if train_state.step % config.log_every == 0:
+            metric_values = {k: float(v) for k, v in metrics.items()}
+            count = metric_values.get("count", 1.0)
             logged = {
-                f"train/{k}": metric_values[k]
-                / (global_batch_size if k.endswith("loss") else count)
-                for k in metric_values
+                "train/loss": float(loss),
+                "train/lm_loss": metric_values.get("lm_loss", 0.0) / count,
+                "train/q_halt_loss": metric_values.get("q_halt_loss", 0.0) / count,
+                "train/info_nce_loss": metric_values.get("encoder/info_nce_loss", 0.0),
+                "train/pos_sim": metric_values.get("encoder/pos_sim", 0.0),
+                "train/top1_i2t": metric_values.get("encoder/top1_i2t", 0.0),
+                "train/top1_t2i": metric_values.get("encoder/top1_t2i", 0.0),
+                "train/lr": float(lr_main),
+                "train/encoder_lr": float(lr_encoder),
             }
-            logged["train/lr"] = float(lr_main)
-            logged["train/task_lr"] = float(lr_task)
             wandb.log(logged, step=train_state.step)
-            progress_bar.update(train_state.step - progress_bar.n)
 
-        if config.eval_every > 0 and train_state.step % config.eval_every == 0:
-            eval_model = ema_helper.ema_copy()
-            eval_rng, eval_step_rng = jax.random.split(eval_rng)
-            eval_logs = evaluate_model(
-                eval_model,
-                test_loader,
-                batch_converter=batch_to_jnp,
-                filter_carry_fn=filter_carry,
-                rng=eval_step_rng,
+        if config.viz_every > 0 and train_state.step % config.viz_every == 0:
+            encoder_model = eqx.combine(
+                train_state.encoder_params, train_state.encoder_static
             )
-            wandb.log(eval_logs, step=train_state.step)
+            viz_img = render_nearest_neighbors(
+                encoder_model,
+                batch_to_np(batch),
+                metadata,
+                top_k=config.viz_neighbors,
+            )
+            wandb.log(
+                {"train/nearest_neighbors": wandb.Image(viz_img)},
+                step=train_state.step,
+            )
 
-        if (
-            config.logit_lens_every > 0
-            and train_state.step % config.logit_lens_every == 0
-        ):
+        if config.logit_lens_every > 0 and train_state.step % config.logit_lens_every == 0:
             lens_model = ema_helper.ema_copy()
-            _, sampled_batch, _ = next(test_loader_iter)
-            test_batch = batch_to_jnp(sampled_batch)
-            logit_lens_rng, lens_step_rng = jax.random.split(logit_lens_rng)
+            encoder_model = eqx.combine(
+                train_state.encoder_params, train_state.encoder_static
+            )
+            _, g1 = encoder_model.encode_views(
+                batch_jnp["inputs_1"], batch_jnp["labels_1"]
+            )
+            task_emb = jnp.repeat(g1, config.examples_per_view, axis=0)
+            task_emb = task_emb.reshape(task_emb.shape[0], 1, -1)
+            trm_batch = flatten_batch(batch_jnp)
             evaluate_logit_lens(
                 lens_model,
-                test_batch,
-                test_metadata,
-                filter_carry_fn=filter_carry,
+                trm_batch,
+                metadata,
+                task_emb=task_emb,
                 step=train_state.step,
-                rng=lens_step_rng,
+                rng=train_state.rng,
             )
 
     wandb.finish()
