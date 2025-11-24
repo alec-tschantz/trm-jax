@@ -172,16 +172,18 @@ def evaluate_logit_lens(
     rng: jnp.ndarray,
     task_emb: jnp.ndarray | None = None,
 ):
+    # batch: flattened {"inputs": (N, seq), "labels": (N, seq), ...}
+    # task_emb: (N, 1, D) or None
+
     single = {
         k: v[:1]
         for k, v in batch.items()
         if k in ("inputs", "labels", "puzzle_identifiers")
     }
     task_emb_single = task_emb[:1] if task_emb is not None else None
+
     carry = model.initial_carry(single)
-    _, y_hidden, z_hidden = _rollout_state_histories(
-        model, carry, rng, task_emb_single
-    )
+    _, y_hidden, z_hidden = _rollout_state_histories(model, carry, rng, task_emb_single)
 
     palette = _build_logit_lens_palette()
     grid_size = int(round(math.sqrt(metadata.seq_len)))
@@ -189,8 +191,8 @@ def evaluate_logit_lens(
     y_tokens = _hidden_to_tokens(y_hidden, model.lm_head, model.task_emb_len)
     z_tokens = _hidden_to_tokens(z_hidden, model.lm_head, model.task_emb_len)
 
-    y_tokens_np = np.asarray(jax.device_get(y_tokens))[:, :, 0]  
-    z_tokens_np = np.asarray(jax.device_get(z_tokens))[:, :, :, 0]  
+    y_tokens_np = np.asarray(jax.device_get(y_tokens))[:, :, 0]
+    z_tokens_np = np.asarray(jax.device_get(z_tokens))[:, :, :, 0]
 
     sample_inputs = np.asarray(jax.device_get(single["inputs"][0]))
     sample_labels = np.asarray(jax.device_get(single["labels"][0]))

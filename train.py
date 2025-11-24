@@ -55,7 +55,6 @@ class TrainConfig:
     forward_dtype: str = "bfloat16"
     task_emb_len: int = 1
 
-    # Encoder
     encoder_hidden_size: int = 512
     encoder_num_layers: int = 4
     encoder_num_heads: int = 8
@@ -118,7 +117,7 @@ def create_encoder(config: TrainConfig, metadata: DatasetMetadata, *, key: jnp.n
         seq_len=metadata.seq_len,
         vocab_size=metadata.vocab_size,
         pad_id=metadata.pad_id,
-        ignore_label_id=metadata.ignore_label_id or DEFAULT_IGNORE_LABEL_ID,
+        ignore_label_id=DEFAULT_IGNORE_LABEL_ID,
         hidden_size=config.encoder_hidden_size,
         num_layers=config.encoder_num_layers,
         num_heads=config.encoder_num_heads,
@@ -238,9 +237,7 @@ def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> C
     )
 
 
-def flatten_batch(
-    batch: Dict[str, jnp.ndarray]
-) -> Dict[str, jnp.ndarray]:
+def flatten_batch(batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
     b, k, s = batch["inputs_1"].shape
     flat_inputs1 = batch["inputs_1"].reshape(b * k, s)
     flat_labels1 = batch["labels_1"].reshape(b * k, s)
@@ -321,9 +318,9 @@ def make_train_step(
             }
             return total_loss, aux
 
-        (loss, aux), grads = eqx.filter_value_and_grad(
-            loss_fn, has_aux=True
-        )((params, encoder_params))
+        (loss, aux), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+            (params, encoder_params)
+        )
 
         grads, _ = clipper.update(grads, optax.EmptyState())
         grads_model, grads_encoder = grads
@@ -364,7 +361,11 @@ def main(config: TrainConfig = TrainConfig()):
     rng, model_key, encoder_key, train_key = rngs
 
     train_state, optimizer, encoder_opt = create_train_state(
-        config, metadata, model_key=model_key, encoder_key=encoder_key, train_key=train_key
+        config,
+        metadata,
+        model_key=model_key,
+        encoder_key=encoder_key,
+        train_key=train_key,
     )
 
     ema_helper = EMAHelper(mu=config.ema_rate)
@@ -469,20 +470,21 @@ def main(config: TrainConfig = TrainConfig()):
 
         if config.logit_lens_every > 0 and train_state.step % config.logit_lens_every == 0:
             lens_model = ema_helper.ema_copy()
+            trm_batch = flatten_batch(batch_jnp)
             encoder_model = eqx.combine(
                 train_state.encoder_params, train_state.encoder_static
             )
-            _, g1 = encoder_model.encode_views(
-                batch_jnp["inputs_1"], batch_jnp["labels_1"]
+            z_full = encoder_model.encode_examples(
+                trm_batch["inputs"],  
+                trm_batch["labels"], 
             )
-            task_emb = jnp.repeat(g1, config.examples_per_view, axis=0)
-            task_emb = task_emb.reshape(task_emb.shape[0], 1, -1)
-            trm_batch = flatten_batch(batch_jnp)
+
+            task_emb_full = z_full[:, None, :]
             evaluate_logit_lens(
                 lens_model,
                 trm_batch,
                 metadata,
-                task_emb=task_emb,
+                task_emb=task_emb_full,
                 step=train_state.step,
                 rng=train_state.rng,
             )
