@@ -23,7 +23,7 @@ from trm.utils import EMAHelper
 @dataclass
 class TrainConfig:
     data_path: str = "data/arc1concept-aug-1000"
-    global_group_batch_size: int = 64
+    global_group_batch_size: int = 32
     examples_per_view: int = 4
     epochs: int = 50000
     lr: float = 1e-4
