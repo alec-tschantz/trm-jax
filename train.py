@@ -23,7 +23,7 @@ from trm.utils import EMAHelper
 @dataclass
 class TrainConfig:
     data_path: str = "data/arc1concept-aug-1000"
-    global_group_batch_size: int = 32
+    global_group_batch_size: int = 16
     examples_per_view: int = 4
     epochs: int = 50000
     lr: float = 1e-4
@@ -443,7 +443,7 @@ def main(config: TrainConfig = TrainConfig()):
                 name = f"train/{k}"
                 if k.endswith("loss") and not k.startswith("encoder/"):
                     logged[name] = v / safe_count
-                elif k in ("accuracy", "exact_accuracy", "q_halt_accuracy"):
+                elif k in ("accuracy", "exact_accuracy", "q_halt_accuracy", "steps"):
                     logged[name] = v / safe_count
                 else:
                     logged[name] = v
