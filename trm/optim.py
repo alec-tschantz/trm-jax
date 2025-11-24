@@ -1,3 +1,4 @@
+import math
 from typing import Any, NamedTuple
 
 import jax
