@@ -293,7 +293,8 @@ def make_train_step(
             flat_inputs = effective_carry.data["inputs"]
             flat_labels = effective_carry.data["labels"]
             z_trm = encoder.encode_examples(flat_inputs, flat_labels)
-            task_emb = jax.lax.stop_gradient(z_trm)[:, None, :]
+            # task_emb = jax.lax.stop_gradient(z_trm)[:, None, :]
+            task_emb = z_trm[:, None, :]
 
             new_carry, trm_loss, trm_metrics, _ = act_loss(
                 model, effective_carry, rng=rng, training=True, task_emb=task_emb
