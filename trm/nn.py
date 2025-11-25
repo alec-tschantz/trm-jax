@@ -64,8 +64,8 @@ class Embedding(eqx.Module):
 
 
 class RotaryEmbedding(eqx.Module):
-    cos_cached: jnp.ndarray
-    sin_cached: jnp.ndarray
+    cos_cached: jnp.ndarray = eqx.field(static=True)
+    sin_cached: jnp.ndarray = eqx.field(static=True)
 
     def __init__(self, dim: int, max_position_embeddings: int, base: float):
         inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
