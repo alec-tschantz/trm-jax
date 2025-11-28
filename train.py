@@ -152,13 +152,15 @@ def create_train_state(
     )
 
 
-def create_dataloader(config: TrainConfig, split: str, **kwargs):
+def create_dataloader(
+    config: TrainConfig, split: str, rank: int = 0, world_size: int = 1, **kwargs
+):
     dataset = Dataset(
         DatasetConfig(
             seed=config.seed,
             dataset_paths=[config.data_path],
-            rank=0,
-            num_replicas=1,
+            rank=rank,
+            num_replicas=world_size,
             **kwargs,
         ),
         split=split,
@@ -226,13 +228,13 @@ def make_train_step(static_model, optimizer, param_labels, clipper):
         opt_state,
         carry,
         batch_data,
-        global_batch_size,
+        local_batch_size,
         rng,
         lr_main,
         lr_task,
         static_repl,
     ):
-        gb = jnp.asarray(global_batch_size, dtype=jnp.float32)
+        lb = jnp.asarray(local_batch_size, dtype=jnp.float32)
 
         def loss_fn(p):
             model = eqx.combine(p, static_repl)
@@ -240,15 +242,15 @@ def make_train_step(static_model, optimizer, param_labels, clipper):
             new_carry, loss, metrics, _ = act_loss(
                 model, inp_carry, rng=rng, training=True
             )
-            return loss / gb, (new_carry, metrics, loss)
+            return loss / lb, (new_carry, metrics, loss)
 
         (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
             loss_fn, has_aux=True
         )(params)
 
         grads = jax.lax.pmean(grads, axis_name="devices")
-        metrics = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name="devices"), metrics)
-        unscaled_loss = jax.lax.pmean(unscaled_loss, axis_name="devices")
+        metrics = jax.tree.map(lambda x: jax.lax.psum(x, axis_name="devices"), metrics)
+        unscaled_loss = jax.lax.psum(unscaled_loss, axis_name="devices")
 
         grads, _ = clipper.update(grads, optax.EmptyState())
         updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -279,6 +281,8 @@ def main(config: TrainConfig = TrainConfig()):
         test_set_mode=False,
         epochs_per_iter=config.epochs,
         global_batch_size=global_batch_size,
+        rank=0,
+        world_size=1,
     )
     test_loader, test_metadata = create_dataloader(
         config,
@@ -286,6 +290,8 @@ def main(config: TrainConfig = TrainConfig()):
         test_set_mode=True,
         epochs_per_iter=1,
         global_batch_size=per_device_batch,
+        rank=0,
+        world_size=1,
     )
 
     test_loader_iter = infinite_dataloader(test_loader)
@@ -366,7 +372,7 @@ def main(config: TrainConfig = TrainConfig()):
             train_state.carry,
             batch_sharded,
             jax.device_put_replicated(
-                jnp.asarray(global_batch_size, dtype=jnp.float32), devices
+                jnp.asarray(per_device_batch, dtype=jnp.float32), devices
             ),
             step_rng,
             jax.device_put_replicated(lr_main, devices),
@@ -385,7 +391,7 @@ def main(config: TrainConfig = TrainConfig()):
             count = max(metric_values.get("count", 1.0), 1.0)
             logged = {
                 f"train/{k}": metric_values[k]
-                / (global_batch_size if k.endswith("loss") else count)
+                / (config.global_batch_size if k.endswith("loss") else count)
                 for k in metric_values
             }
             logged["train/lr"] = float(lr_main)
