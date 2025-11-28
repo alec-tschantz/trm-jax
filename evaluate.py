@@ -43,6 +43,7 @@ class EvalState(NamedTuple):
     q_halt_accuracy: jnp.ndarray
     count: jnp.ndarray
     lm_loss: jnp.ndarray
+    steps: jnp.ndarray
 
 
 def evaluate_model(
@@ -58,8 +59,8 @@ def evaluate_model(
         "accuracy": 0.0,
         "exact_accuracy": 0.0,
         "q_halt_accuracy": 0.0,
+        "steps": 0.0,
         "count": 0.0,
-        "loss_denominator": 0.0,
     }
     max_steps = model.config.halt_max_steps
 
@@ -76,16 +77,16 @@ def evaluate_model(
         totals["q_halt_accuracy"] += aggregates.q_halt_accuracy
         totals["count"] += aggregates.count
         totals["lm_loss"] += aggregates.lm_loss
-        totals["loss_denominator"] += float(global_batch_size)
+        totals["steps"] += aggregates.steps
 
     results = {}
-    if totals["loss_denominator"] > 0:
-        results["test/lm_loss"] = totals["lm_loss"] / totals["loss_denominator"]
     if totals["count"] > 0:
         denom = max(totals["count"], 1e-8)
+        results["test/lm_loss"] = totals["lm_loss"] / denom
         results["test/accuracy"] = totals["accuracy"] / denom
         results["test/exact_accuracy"] = totals["exact_accuracy"] / denom
         results["test/q_halt_accuracy"] = totals["q_halt_accuracy"] / denom
+        results["test/steps"] = totals["steps"] / denom
     return results
 
 
@@ -155,7 +156,8 @@ def _eval_rollout(
             exact_accuracy=agg.exact_accuracy + metrics["exact_accuracy"],
             q_halt_accuracy=agg.q_halt_accuracy + metrics["q_halt_accuracy"],
             count=agg.count + metrics["count"],
-            lm_loss=metrics["lm_loss"],
+            lm_loss=agg.lm_loss + metrics["lm_loss"],
+            steps=agg.steps + metrics["steps"],
         )
         new_finished = jnp.logical_or(finished, all_finish)
         return carry, new_agg, steps + 1, new_finished, rng
@@ -253,7 +255,7 @@ def _render_logit_lens_frames(
 
 def _zero_eval_state(dtype=jnp.float32) -> EvalState:
     zero = jnp.array(0.0, dtype=dtype)
-    return EvalState(zero, zero, zero, zero, zero)
+    return EvalState(zero, zero, zero, zero, zero, zero)
 
 
 def _build_logit_lens_palette() -> np.ndarray:

@@ -151,7 +151,7 @@ class Attention(eqx.Module):
             b, s, self.num_heads + 2 * self.num_key_value_heads, self.head_dim
         )
 
-        q = qkv[:, :, : self.num_heads]
+        q = qkv[:, :, : self.num_heads]  # (B, S, H, D)
         k = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
         v = qkv[:, :, self.num_heads + self.num_key_value_heads :]
 
@@ -161,25 +161,13 @@ class Attention(eqx.Module):
             sin = sin[:s]
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        q = q.astype(jnp.float32)
-        k = k.astype(jnp.float32)
-        v = v.astype(jnp.float32)
+        q = q.astype(jnp.bfloat16)
+        k = k.astype(jnp.bfloat16)
+        v = v.astype(jnp.bfloat16)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn_scores = jnp.einsum("bthd,bshd->bhts", q, k) * scale
+        out_heads = _flash_attention(q, k, v, causal=self.causal)  # (B, S, H, D)
 
-        if self.causal:
-            mask = jnp.tril(jnp.ones((s, s), dtype=bool))
-            attn_scores = jnp.where(
-                mask[None, None, :, :],
-                attn_scores,
-                jnp.full_like(attn_scores, -1e30),
-            )
-
-        attn = jax.nn.softmax(attn_scores, axis=-1)
-        out = jnp.einsum("bhts,bshd->bthd", attn, v)
-        out = out.reshape(b, s, self.output_size)
-
+        out = out_heads.reshape(b, s, self.output_size)
         out = out.astype(out_dtype)
         return self.o_proj(out)
 
@@ -253,6 +241,48 @@ class Transformer(eqx.Module):
         for layer in self.layers:
             h = layer(cos_sin, h)
         return h
+
+
+def _flash_attention(
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    *,
+    causal: bool,
+) -> jnp.ndarray:
+
+    B, T, H, D = q.shape
+    S = k.shape[1]
+
+    def _pad(x: jnp.ndarray, pad_len: int) -> jnp.ndarray:
+        return jnp.pad(x, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+
+    Q = ((T + 3) // 4) * 4
+    K = ((S + 3) // 4) * 4
+    pad_T = Q - T
+    pad_S = K - S
+
+    q_p = _pad(q, pad_T)
+    k_p = _pad(k, pad_S)
+    v_p = _pad(v, pad_S)
+
+    attention_mask = jnp.ones((Q, K), dtype=jnp.bool_)
+    attention_mask = attention_mask.at[T:, :].set(False)
+    attention_mask = attention_mask.at[:, S:].set(False)
+
+    mask = attention_mask[None, None, :, :]
+
+    out = jax.nn.dot_product_attention(
+        query=q_p,
+        key=k_p,
+        value=v_p,
+        mask=mask,
+        bias=None,
+        implementation="cudnn",
+        is_causal=causal,
+    )
+
+    return out[:, :T, :, :]
 
 
 def rms_norm(hidden_states: jnp.ndarray, eps: float) -> jnp.ndarray:

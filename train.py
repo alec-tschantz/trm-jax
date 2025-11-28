@@ -23,20 +23,20 @@ from trm.utils import EMAHelper
 
 @dataclass
 class TrainConfig:
-    data_path: str = "data/maze-30x30-hard-1k"
+    data_path: str = "data/arc1concept-aug-1000"
     global_batch_size: int = 192
-    epochs: int = 50000
+    epochs: int = 100000
     lr: float = 1e-4
     lr_min_ratio: float = 1.0
     lr_warmup_steps: int = 2000
-    weight_decay: float = 1.0
+    weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
-    task_emb_lr: float = 1e-4
-    task_emb_weight_decay: float = 1.0
+    task_emb_lr: float = 1e-2
+    task_emb_weight_decay: float = 0.1
     grad_clip_norm: float = 1.0
-    project_name: str = "trm-arc"
-    run_name: str = "trm-maze"
+    project_name: str = "Arc1concept-aug-1000-ACT-torch"
+    run_name: str = "trm-flash-attention"
     seed: int = 0
     ema_rate: float = 0.999
     eval_every: int = 1000

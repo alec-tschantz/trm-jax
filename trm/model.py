@@ -185,7 +185,6 @@ class Model(eqx.Module):
             hist = (jax.lax.stop_gradient(y_next), z_hist) if record else None
             return (y_c, z_c), hist
 
-        body = eqx.filter_checkpoint(body)
         (y_final, z_final), hist = jax.lax.scan(body, (y0, z0), is_last)
         y_hist, z_hist = hist if record else (None, None)
 
