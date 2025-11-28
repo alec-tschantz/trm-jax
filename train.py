@@ -18,6 +18,7 @@ from dataset import Dataset, DatasetConfig, DatasetMetadata
 from evaluate import evaluate_model, evaluate_logit_lens
 from trm.losses import act_loss
 from trm.model import Carry, Model, ModelConfig
+from trm.encoder import Encoder
 from trm.optim import adam_atan2, sparse_sign_sgd, cosine_warmup_schedule
 from trm.utils import EMAHelper
 
@@ -68,18 +69,27 @@ class TrainState:
     rng: jnp.ndarray
 
 
-def create_model(
+def create_modules(
     config: TrainConfig,
     train_metadata: DatasetMetadata,
     *,
     key: jnp.ndarray,
     per_device_batch_size: int,
 ):
+    k_enc, k_model = jax.random.split(key)
+
+    encoder = Encoder(
+        num_task_identifiers=train_metadata.num_puzzle_identifiers,
+        task_emb_ndim=config.task_emb_ndim,
+        task_emb_len=config.task_emb_len,
+        hidden_size=config.hidden_size,
+        forward_dtype=config.forward_dtype,
+        key=k_enc,
+    )
+
     model_cfg = ModelConfig(
         batch_size=per_device_batch_size,
         seq_len=train_metadata.seq_len,
-        task_emb_ndim=config.task_emb_ndim,
-        num_task_identifiers=train_metadata.num_puzzle_identifiers,
         vocab_size=train_metadata.vocab_size,
         y_cycles=config.y_cycles,
         z_cycles=config.z_cycles,
@@ -93,12 +103,13 @@ def create_model(
         task_emb_len=config.task_emb_len,
     )
 
-    model = Model(model_cfg, key=key)
-    params, static = eqx.partition(model, eqx.is_array)
+    model = Model(model_cfg, key=k_model)
+    modules = (encoder, model)
+    params, static = eqx.partition(modules, eqx.is_array)
 
     def build_param_labels(p):
         labels = jtu.tree_map(lambda _: 0, p)
-        labels = eqx.tree_at(lambda tree: tree.task_embed.weight, labels, 1)
+        labels = eqx.tree_at(lambda tree: tree[0].task_embed.weight, labels, 1)
         return labels
 
     param_labels = build_param_labels(params)
@@ -131,7 +142,7 @@ def create_train_state(
         * train_metadata.mean_puzzle_examples
         / config.global_batch_size
     )
-    params, static, optimizer, opt_state, param_labels = create_model(
+    params, static, optimizer, opt_state, param_labels = create_modules(
         config,
         train_metadata,
         key=model_key,
@@ -235,8 +246,11 @@ def make_train_step(static_model, optimizer, param_labels, clipper):
         gb = jnp.asarray(global_batch_size, dtype=jnp.float32)
 
         def loss_fn(p):
-            model = eqx.combine(p, static_repl)
-            inp_carry = filter_carry(model, carry, batch_data)
+            encoder, model = eqx.combine(p, static_repl)
+            task_tokens = encoder(batch_data["inputs"], batch_data["puzzle_identifiers"])
+            batch_with_tokens = dict(batch_data)
+            batch_with_tokens["task_tokens"] = task_tokens
+            inp_carry = filter_carry(model, carry, batch_with_tokens)
             new_carry, loss, metrics, _ = act_loss(
                 model, inp_carry, rng=rng, training=True
             )
@@ -334,8 +348,11 @@ def main(config: TrainConfig = TrainConfig()):
 
     @jax.pmap
     def init_carry(params, static_model, batch):
-        model = eqx.combine(params, static_model)
-        return model.initial_carry(batch)
+        encoder, model = eqx.combine(params, static_model)
+        task_tokens = encoder(batch["inputs"], batch["puzzle_identifiers"])
+        batch_aug = dict(batch)
+        batch_aug["task_tokens"] = task_tokens
+        return model.initial_carry(batch_aug)
 
     for _, batch, _ in train_loader:
         if train_state.step >= train_state.total_steps:
@@ -394,10 +411,11 @@ def main(config: TrainConfig = TrainConfig()):
             progress_bar.update(train_state.step - progress_bar.n)
 
         if config.eval_every > 0 and train_state.step % config.eval_every == 0:
-            eval_model = ema_helper.ema_copy()
+            eval_encoder, eval_model = ema_helper.ema_copy()
             eval_rng, eval_step_rng = jax.random.split(eval_rng)
             eval_batches = [next(test_loader_iter) for _ in range(config.eval_batches)]
             eval_logs = evaluate_model(
+                eval_encoder,
                 eval_model,
                 eval_batches,
                 batch_converter=batch_to_jnp,
@@ -410,8 +428,9 @@ def main(config: TrainConfig = TrainConfig()):
             config.logit_lens_every > 0
             and train_state.step % config.logit_lens_every == 0
         ):
-            lens_model = ema_helper.ema_copy()
+            lens_encoder, lens_model = ema_helper.ema_copy()
             evaluate_logit_lens(
+                lens_encoder,
                 lens_model,
                 {k: v[:per_device_batch] for k, v in batch_jnp.items()},
                 train_metadata,
@@ -425,6 +444,7 @@ def main(config: TrainConfig = TrainConfig()):
             test_batch = batch_to_jnp(sampled_batch)
             logit_lens_rng, lens_step_rng = jax.random.split(logit_lens_rng)
             evaluate_logit_lens(
+                lens_encoder,
                 lens_model,
                 test_batch,
                 test_metadata,

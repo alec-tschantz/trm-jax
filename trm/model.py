@@ -13,7 +13,6 @@ from trm.nn import (
     Embedding,
     Linear,
     RotaryEmbedding,
-    SparseEmbedding,
     Transformer,
 )
 
@@ -22,8 +21,6 @@ from trm.nn import (
 class ModelConfig:
     batch_size: int
     seq_len: int
-    task_emb_ndim: int
-    num_task_identifiers: int
     vocab_size: int
 
     y_cycles: int
@@ -67,7 +64,6 @@ class Model(eqx.Module):
     embed_tokens: Embedding
     lm_head: Linear
     q_head: Linear
-    task_embed: SparseEmbedding
     rotary_emb: RotaryEmbedding
     network: Transformer
 
@@ -80,7 +76,7 @@ class Model(eqx.Module):
         self.task_emb_len = config.task_emb_len
         embed_init_std = 1.0 / self.embed_scale
 
-        k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
+        k1, k2, k3, k5, k6, k7 = jax.random.split(key, 6)
 
         self.embed_tokens = Embedding(
             config.vocab_size,
@@ -89,15 +85,6 @@ class Model(eqx.Module):
             key=k1,
             cast_to=dtype,
         )
-
-        self.task_embed = SparseEmbedding(
-            config.num_task_identifiers,
-            config.task_emb_ndim,
-            init_std=0.0,
-            cast_to=dtype,
-            key=k4,
-        )
-
         self.rotary_emb = RotaryEmbedding(
             dim=config.hidden_size // config.num_heads,
             max_position_embeddings=config.seq_len + config.task_emb_len,
@@ -139,7 +126,7 @@ class Model(eqx.Module):
     ):
         batch = carry.data
         cos_sin = self.rotary_emb()
-        x_embed = self.embed_inputs(batch["inputs"], batch["puzzle_identifiers"])
+        x_embed = self.embed_inputs(batch["inputs"], batch["task_tokens"])
 
         y, z, iters_aux = self.run_iters(
             x_embed,
@@ -210,17 +197,11 @@ class Model(eqx.Module):
         )
         return z_final, z_hist
 
-    def embed_inputs(self, inputs: jnp.ndarray, task_ids: jnp.ndarray) -> jnp.ndarray:
+    def embed_inputs(
+        self, inputs: jnp.ndarray, task_tokens: jnp.ndarray
+    ) -> jnp.ndarray:
         tok = self.embed_tokens(inputs.astype(jnp.int32))
-
-        task = self.task_embed(task_ids)
-        need = self.task_emb_len * self.config.hidden_size - task.shape[-1]
-        if need > 0:
-            task = jnp.pad(task, ((0, 0), (0, need)))
-
-        task = task.reshape(-1, self.task_emb_len, self.config.hidden_size)
-        emb = jnp.concatenate([task, tok], axis=1)
-
+        emb = jnp.concatenate([task_tokens, tok], axis=1)
         emb = (emb * self.embed_scale).astype(self.forward_dtype)
         return emb
 

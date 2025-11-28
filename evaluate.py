@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from dataset import DatasetMetadata
 from trm.losses import act_loss, IGNORE_LABEL_ID
 from trm.model import Carry, Model
+from trm.encoder import Encoder
 
 LOGIT_LENS_COLORS = [
     (25, 25, 25),
@@ -47,6 +48,7 @@ class EvalState(NamedTuple):
 
 
 def evaluate_model(
+    encoder: Encoder,
     model: Model,
     dataloader: Any,
     *,
@@ -66,6 +68,9 @@ def evaluate_model(
 
     for _, batch, global_batch_size in dataloader:
         batch_jnp = batch_converter(batch)
+        task_tokens = encoder(batch_jnp["inputs"], batch_jnp["puzzle_identifiers"])
+        batch_jnp = dict(batch_jnp)
+        batch_jnp["task_tokens"] = task_tokens
         carry = model.initial_carry(batch_jnp)
         carry = filter_carry_fn(model, carry, batch_jnp)
 
@@ -91,6 +96,7 @@ def evaluate_model(
 
 
 def evaluate_logit_lens(
+    encoder: Encoder,
     model: Model,
     batch: Dict[str, jnp.ndarray],
     metadata: DatasetMetadata,
@@ -105,6 +111,9 @@ def evaluate_logit_lens(
         for k, v in batch.items()
         if k in ("inputs", "labels", "puzzle_identifiers")
     }
+    task_tokens = encoder(single["inputs"], single["puzzle_identifiers"])
+    single = dict(single)
+    single["task_tokens"] = task_tokens
     carry = model.initial_carry(single)
     carry = filter_carry_fn(model, carry, single)
     _, y_hidden, z_hidden = _rollout_state_histories(model, carry, rng)
