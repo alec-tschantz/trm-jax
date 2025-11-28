@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict
 
@@ -39,8 +40,10 @@ class TrainConfig:
     run_name: str = "trm-flash-attention"
     seed: int = 0
     ema_rate: float = 0.999
-    eval_every: int = 1000
+    eval_every: int = 200
     logit_lens_every: int = 200
+    eval_batches: int = 5
+    checkpoint_every: int = 0
     halt_exploration_prob: float = 0.1
     halt_max_steps: int = 16
     y_cycles: int = 3
@@ -334,9 +337,10 @@ def main(config: TrainConfig = TrainConfig()):
         if config.eval_every > 0 and train_state.step % config.eval_every == 0:
             eval_model = ema_helper.ema_copy()
             eval_rng, eval_step_rng = jax.random.split(eval_rng)
+            eval_batches = [next(test_loader_iter) for _ in range(config.eval_batches)]
             eval_logs = evaluate_model(
                 eval_model,
-                test_loader,
+                eval_batches,
                 batch_converter=batch_to_jnp,
                 filter_carry_fn=filter_carry,
                 rng=eval_step_rng,
@@ -348,6 +352,16 @@ def main(config: TrainConfig = TrainConfig()):
             and train_state.step % config.logit_lens_every == 0
         ):
             lens_model = ema_helper.ema_copy()
+            evaluate_logit_lens(
+                lens_model,
+                batch_jnp,
+                train_metadata,
+                filter_carry_fn=filter_carry,
+                step=train_state.step,
+                rng=logit_lens_rng,
+                log_prefix="logit_lens/train",
+            )
+
             _, sampled_batch, _ = next(test_loader_iter)
             test_batch = batch_to_jnp(sampled_batch)
             logit_lens_rng, lens_step_rng = jax.random.split(logit_lens_rng)
@@ -358,6 +372,17 @@ def main(config: TrainConfig = TrainConfig()):
                 filter_carry_fn=filter_carry,
                 step=train_state.step,
                 rng=lens_step_rng,
+                log_prefix="logit_lens/test",
+            )
+
+        if (
+            config.checkpoint_every > 0
+            and train_state.step % config.checkpoint_every == 0
+        ):
+            os.makedirs("checkpoints", exist_ok=True)
+            ckpt_path = os.path.join("checkpoints", f"{config.run_name}.eqx")
+            eqx.tree_serialise_leaves(
+                ckpt_path, eqx.combine(train_state.params, train_state.static)
             )
 
     wandb.finish()

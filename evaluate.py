@@ -11,7 +11,7 @@ import wandb
 from torch.utils.data import DataLoader
 
 from dataset import DatasetMetadata
-from trm.losses import act_loss
+from trm.losses import act_loss, IGNORE_LABEL_ID
 from trm.model import Carry, Model
 
 LOGIT_LENS_COLORS = [
@@ -48,7 +48,7 @@ class EvalState(NamedTuple):
 
 def evaluate_model(
     model: Model,
-    dataloader: DataLoader,
+    dataloader: Any,
     *,
     batch_converter: Callable[[Dict[str, Any]], Dict[str, jnp.ndarray]],
     filter_carry_fn: Callable[[Model, Carry, Dict[str, jnp.ndarray]], Carry],
@@ -98,6 +98,7 @@ def evaluate_logit_lens(
     *,
     step: int,
     rng: jnp.ndarray,
+    log_prefix: str = "logit_lens",
 ):
     single = {
         k: v[:1]
@@ -119,6 +120,7 @@ def evaluate_logit_lens(
 
     sample_inputs = np.asarray(jax.device_get(single["inputs"][0]))
     sample_labels = np.asarray(jax.device_get(single["labels"][0]))
+    invalid_mask = sample_labels == IGNORE_LABEL_ID
 
     frames = _render_logit_lens_frames(
         y_tokens_np,
@@ -127,10 +129,11 @@ def evaluate_logit_lens(
         sample_labels,
         palette,
         grid_size,
+        invalid_mask,
     )
 
     wandb.log(
-        {"logit_lens/video": wandb.Video(frames, format="mp4", fps=4)},
+        {f"{log_prefix}/video": wandb.Video(frames, format="mp4", fps=4)},
         step=step,
     )
 
@@ -202,6 +205,7 @@ def _render_logit_lens_frames(
     sample_outputs: np.ndarray,
     palette: np.ndarray,
     grid_size: int,
+    invalid_mask: np.ndarray,
 ) -> np.ndarray:
     frames: List[np.ndarray] = []
 
@@ -223,6 +227,7 @@ def _render_logit_lens_frames(
                 palette,
                 grid_size,
                 f"y={y_idx}",
+                mask=invalid_mask,
             )
             inner_cycles = max(z_cycles, 1)
 
@@ -233,6 +238,7 @@ def _render_logit_lens_frames(
                         palette,
                         grid_size,
                         "z",
+                        mask=invalid_mask,
                     )
                 else:
                     z_panel = _render_panel(
@@ -240,6 +246,7 @@ def _render_logit_lens_frames(
                         palette,
                         grid_size,
                         f"z={z_idx}",
+                        mask=invalid_mask,
                     )
                 frame = _grid_from_panels(
                     y_panel,
@@ -262,10 +269,19 @@ def _build_logit_lens_palette() -> np.ndarray:
     return np.asarray(LOGIT_LENS_COLORS, dtype=np.uint8)
 
 
-def _tokens_to_color_grid(tokens: np.ndarray, palette: np.ndarray, grid_size: int):
+def _tokens_to_color_grid(
+    tokens: np.ndarray,
+    palette: np.ndarray,
+    grid_size: int,
+    mask: np.ndarray | None = None,
+):
     flat = tokens.reshape(grid_size, grid_size)
     indices = np.mod(flat, palette.shape[0])
     colors = palette[np.clip(indices, 0, palette.shape[0] - 1)]
+    if mask is not None:
+        mask = mask.reshape(grid_size, grid_size)
+        bg = np.array(LOGIT_LENS_TITLE_BG, dtype=np.uint8)
+        colors = np.where(mask[..., None], bg, colors)
     return colors.astype(np.uint8)
 
 
@@ -278,9 +294,13 @@ def _hidden_to_tokens(
 
 
 def _render_panel(
-    tokens: np.ndarray, palette: np.ndarray, grid_size: int, title: str
+    tokens: np.ndarray,
+    palette: np.ndarray,
+    grid_size: int,
+    title: str,
+    mask: np.ndarray | None = None,
 ) -> Image.Image:
-    colors = _tokens_to_color_grid(tokens, palette, grid_size)
+    colors = _tokens_to_color_grid(tokens, palette, grid_size, mask)
     img = Image.fromarray(colors, mode="RGB")
     img = img.resize((LOGIT_LENS_PANEL_SIZE, LOGIT_LENS_PANEL_SIZE), Image.NEAREST)
 
