@@ -239,7 +239,9 @@ class Transformer(eqx.Module):
     def __call__(self, h: jnp.ndarray, x: jnp.ndarray, cos_sin: CosSin) -> jnp.ndarray:
         h = h + x
         for layer in self.layers:
-            h = layer(cos_sin, h)
+            # h = layer(cos_sin, h)
+            h = eqx.filter_checkpoint(layer)(cos_sin, h)
+
         return h
 
 

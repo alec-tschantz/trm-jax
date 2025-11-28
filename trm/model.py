@@ -205,7 +205,6 @@ class Model(eqx.Module):
             hist = jax.lax.stop_gradient(z_next) if record else None
             return z_next, hist
 
-        body = eqx.filter_checkpoint(body)
         z_final, z_hist = jax.lax.scan(
             body, z_state, xs=None, length=self.config.z_cycles
         )
