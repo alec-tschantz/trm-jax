@@ -25,7 +25,7 @@ from trm.utils import EMAHelper
 @dataclass
 class TrainConfig:
     data_path: str = "data/arc1concept-aug-1000"
-    global_batch_size: int = 192
+    global_batch_size: int = 768
     epochs: int = 100000
     lr: float = 1e-4
     lr_min_ratio: float = 1.0
@@ -73,9 +73,10 @@ def create_model(
     train_metadata: DatasetMetadata,
     *,
     key: jnp.ndarray,
+    per_device_batch_size: int,
 ):
     model_cfg = ModelConfig(
-        batch_size=config.global_batch_size,
+        batch_size=per_device_batch_size,
         seq_len=train_metadata.seq_len,
         task_emb_ndim=config.task_emb_ndim,
         num_task_identifiers=train_metadata.num_puzzle_identifiers,
@@ -122,6 +123,7 @@ def create_train_state(
     *,
     model_key: jnp.ndarray,
     train_key: jnp.ndarray,
+    per_device_batch_size: int,
 ):
     total_steps = int(
         config.epochs
@@ -130,7 +132,10 @@ def create_train_state(
         / config.global_batch_size
     )
     params, static, optimizer, opt_state, param_labels = create_model(
-        config, train_metadata, key=model_key
+        config,
+        train_metadata,
+        key=model_key,
+        per_device_batch_size=per_device_batch_size,
     )
     return (
         TrainState(
@@ -165,6 +170,13 @@ def create_dataloader(config: TrainConfig, split: str, **kwargs):
         pin_memory=True,
     )
     return dataloader, dataset.metadata
+
+
+def shard_batch(batch: Dict[str, jnp.ndarray], num_devices: int, per_device_batch: int):
+    def _reshape(x):
+        return x.reshape((num_devices, per_device_batch) + x.shape[1:])
+
+    return {k: _reshape(v) for k, v in batch.items()}
 
 
 def infinite_dataloader(dataloader: DataLoader):
@@ -209,14 +221,21 @@ def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> C
 
 
 def make_train_step(static_model, optimizer, param_labels, clipper):
-    @eqx.filter_jit
-    def train_step(
-        params, opt_state, carry, batch_data, global_batch_size, rng, lr_main, lr_task
+    def train_step_fn(
+        params,
+        opt_state,
+        carry,
+        batch_data,
+        global_batch_size,
+        rng,
+        lr_main,
+        lr_task,
+        static_repl,
     ):
         gb = jnp.asarray(global_batch_size, dtype=jnp.float32)
 
         def loss_fn(p):
-            model = eqx.combine(p, static_model)
+            model = eqx.combine(p, static_repl)
             inp_carry = filter_carry(model, carry, batch_data)
             new_carry, loss, metrics, _ = act_loss(
                 model, inp_carry, rng=rng, training=True
@@ -226,6 +245,10 @@ def make_train_step(static_model, optimizer, param_labels, clipper):
         (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
             loss_fn, has_aux=True
         )(params)
+
+        grads = jax.lax.pmean(grads, axis_name="devices")
+        metrics = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name="devices"), metrics)
+        unscaled_loss = jax.lax.pmean(unscaled_loss, axis_name="devices")
 
         grads, _ = clipper.update(grads, optax.EmptyState())
         updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -240,25 +263,29 @@ def make_train_step(static_model, optimizer, param_labels, clipper):
         params = optax.apply_updates(params, updates)
         return params, opt_state, new_carry, unscaled_loss, metrics
 
-    return train_step
+    return jax.pmap(train_step_fn, axis_name="devices")
 
 
 def main(config: TrainConfig = TrainConfig()):
     torch.random.manual_seed(config.seed)
+
+    num_devices = jax.local_device_count()
+    per_device_batch = config.global_batch_size // num_devices
+    global_batch_size = config.global_batch_size
 
     train_loader, train_metadata = create_dataloader(
         config,
         "train",
         test_set_mode=False,
         epochs_per_iter=config.epochs,
-        global_batch_size=config.global_batch_size,
+        global_batch_size=global_batch_size,
     )
     test_loader, test_metadata = create_dataloader(
         config,
         "test",
         test_set_mode=True,
         epochs_per_iter=1,
-        global_batch_size=config.global_batch_size,
+        global_batch_size=per_device_batch,
     )
 
     test_loader_iter = infinite_dataloader(test_loader)
@@ -268,7 +295,23 @@ def main(config: TrainConfig = TrainConfig()):
     rng, model_key, train_key, eval_rng, logit_lens_rng = rngs
 
     train_state, optimizer, param_labels = create_train_state(
-        config, train_metadata, model_key=model_key, train_key=train_key
+        config,
+        train_metadata,
+        model_key=model_key,
+        train_key=train_key,
+        per_device_batch_size=per_device_batch,
+    )
+
+    devices = jax.local_devices()
+    static_host = train_state.static
+    train_state = TrainState(
+        params=jax.device_put_replicated(train_state.params, devices),
+        static=jax.device_put_replicated(train_state.static, devices),
+        opt_state=jax.device_put_replicated(train_state.opt_state, devices),
+        carry=None,
+        step=train_state.step,
+        total_steps=train_state.total_steps,
+        rng=train_state.rng,
     )
 
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
@@ -279,25 +322,37 @@ def main(config: TrainConfig = TrainConfig()):
         settings=wandb.Settings(_disable_stats=True),
     )
 
+    def unreplicate(tree):
+        return jax.tree.map(lambda x: x[0], tree)
+
+    params_host = unreplicate(train_state.params)
     ema_helper = EMAHelper(mu=config.ema_rate)
-    ema_helper.register(eqx.combine(train_state.params, train_state.static))
+    ema_helper.register(eqx.combine(params_host, static_host))
     clipper = optax.clip_by_global_norm(config.grad_clip_norm)
 
     train_step = make_train_step(train_state.static, optimizer, param_labels, clipper)
 
-    for _, batch, global_batch_size in train_loader:
+    @jax.pmap
+    def init_carry(params, static_model, batch):
+        model = eqx.combine(params, static_model)
+        return model.initial_carry(batch)
+
+    for _, batch, _ in train_loader:
         if train_state.step >= train_state.total_steps:
             break
 
         batch_jnp = batch_to_jnp(batch)
+        batch_sharded = shard_batch(batch_jnp, num_devices, per_device_batch)
 
         if train_state.carry is None:
-            model = eqx.combine(train_state.params, train_state.static)
-            train_state.carry = model.initial_carry(batch_jnp)
+            train_state.carry = init_carry(
+                train_state.params, train_state.static, batch_sharded
+            )
 
         lr_main = compute_lr(config.lr, config, train_state)
         lr_task = compute_lr(config.task_emb_lr, config, train_state)
-        rng, step_rng = jax.random.split(train_state.rng)
+        rngs = jax.random.split(train_state.rng, num_devices + 1)
+        rng, step_rng = rngs[0], jnp.stack(rngs[1:])
 
         (
             new_params,
@@ -309,19 +364,23 @@ def main(config: TrainConfig = TrainConfig()):
             train_state.params,
             train_state.opt_state,
             train_state.carry,
-            batch_jnp,
-            jnp.asarray(global_batch_size, dtype=jnp.float32),
+            batch_sharded,
+            jax.device_put_replicated(
+                jnp.asarray(global_batch_size, dtype=jnp.float32), devices
+            ),
             step_rng,
-            lr_main,
-            lr_task,
+            jax.device_put_replicated(lr_main, devices),
+            jax.device_put_replicated(lr_task, devices),
+            train_state.static,
         )
         train_state.params = new_params
         train_state.step += 1
         train_state.rng = rng
 
-        ema_helper.update(eqx.combine(train_state.params, train_state.static))
+        params_host = unreplicate(train_state.params)
+        ema_helper.update(eqx.combine(params_host, static_host))
 
-        metric_values = {k: float(v) for k, v in metrics.items()}
+        metric_values = {k: float(v[0]) for k, v in metrics.items()}
         if len(metric_values):
             count = max(metric_values.get("count", 1.0), 1.0)
             logged = {
@@ -354,7 +413,7 @@ def main(config: TrainConfig = TrainConfig()):
             lens_model = ema_helper.ema_copy()
             evaluate_logit_lens(
                 lens_model,
-                batch_jnp,
+                {k: v[:per_device_batch] for k, v in batch_jnp.items()},
                 train_metadata,
                 filter_carry_fn=filter_carry,
                 step=train_state.step,
@@ -381,9 +440,7 @@ def main(config: TrainConfig = TrainConfig()):
         ):
             os.makedirs("checkpoints", exist_ok=True)
             ckpt_path = os.path.join("checkpoints", f"{config.run_name}.eqx")
-            eqx.tree_serialise_leaves(
-                ckpt_path, eqx.combine(train_state.params, train_state.static)
-            )
+            eqx.tree_serialise_leaves(ckpt_path, eqx.combine(params_host, static_host))
 
     wandb.finish()
 
