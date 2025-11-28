@@ -40,9 +40,9 @@ class TrainConfig:
     run_name: str = "trm-flash-attention"
     seed: int = 0
     ema_rate: float = 0.999
-    eval_every: int = 200
-    logit_lens_every: int = 200
-    eval_batches: int = 5
+    eval_every: int = 1000
+    logit_lens_every: int = 250
+    eval_batches: int = 10
     checkpoint_every: int = 0
     halt_exploration_prob: float = 0.1
     halt_max_steps: int = 16
