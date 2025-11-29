@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Dict
+from typing import Any, Dict
 
 import equinox as eqx
 import jax
@@ -14,7 +14,6 @@ import wandb
 from torch.utils.data import DataLoader
 
 from dataset import Dataset, DatasetConfig, DatasetMetadata
-from evaluate import evaluate_model
 from trm.losses import act_loss
 from trm.model import Carry, Model, ModelConfig
 from trm.optim import adam_atan2, sparse_sign_sgd, cosine_warmup_schedule
@@ -26,6 +25,8 @@ class TrainConfig:
     data_path: str = "data/arc1concept-aug-1000"
     global_batch_size: int = 768
     epochs: int = 100000
+    eval_every: int = 200
+    eval_batches: int = 1
     lr: float = 1e-4
     lr_min_ratio: float = 1.0
     lr_warmup_steps: int = 2000
@@ -36,12 +37,9 @@ class TrainConfig:
     task_emb_weight_decay: float = 0.1
     grad_clip_norm: float = 1.0
     project_name: str = "Arc1concept-aug-1000-ACT-torch"
-    run_name: str = "trm-flash-attention"
+    run_name: str = "trm-v1"
     seed: int = 0
     ema_rate: float = 0.999
-    eval_every: int = 1000
-    eval_batches: int = 32
-    checkpoint_every: int = 0
     halt_exploration_prob: float = 0.1
     halt_max_steps: int = 16
     y_cycles: int = 3
@@ -189,6 +187,32 @@ def batch_to_jnp(batch: Dict[str, torch.Tensor]) -> Dict[str, jnp.ndarray]:
     return {k: jnp.asarray(v.detach().cpu().numpy()) for k, v in batch.items()}
 
 
+def unreplicate(tree):
+    return jax.tree.map(lambda x: x[0], tree)
+
+
+def log_metrics(
+    metrics: Dict[str, jnp.ndarray],
+    lr_main: jnp.ndarray,
+    lr_task: jnp.ndarray,
+    step: int,
+    config: TrainConfig,
+):
+    mv = {k: float(v) for k, v in metrics.items()}
+    count = mv.get("count", 0.0)
+    if count <= 0:
+        return
+    logged = {
+        f"train/{k}": (
+            mv[k] / config.global_batch_size if k.endswith("loss") else mv[k] / count
+        )
+        for k in mv
+    }
+    logged["train/lr"] = float(lr_main)
+    logged["train/task_lr"] = float(lr_task)
+    wandb.log(logged, step=step)
+
+
 def compute_lr(base_lr: float, config: TrainConfig, train_state: TrainState):
     lr = cosine_warmup_schedule(
         current_step=train_state.step,
@@ -218,6 +242,70 @@ def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> C
         halted=halted,
         data=data,
     )
+
+
+def evaluate_model(
+    model: Model,
+    dataloader: Any,
+    rng: jnp.ndarray,
+    num_batches: int,
+    devices,
+    per_device_batch: int,
+) -> Dict[str, float]:
+    eval_step = make_eval_step(model.config.halt_max_steps)
+    model_repl = jax.device_put_replicated(model, devices)
+    num_devices = len(devices)
+    totals = None
+
+    for _ in range(num_batches):
+        _, batch, _ = next(dataloader)
+        b = batch_to_jnp(batch)
+        b = shard_batch(b, num_devices, per_device_batch)
+        rng, sr = jax.random.split(rng)
+        sr = jnp.stack(jax.random.split(sr, num_devices))
+        m = unreplicate(eval_step(model_repl, b, sr))
+        totals = m if totals is None else jtu.tree_map(lambda a, b: a + b, totals, m)
+
+    tf = {k: float(v) for k, v in totals.items()}
+    count = tf.get("count", 0.0)
+    if count <= 0:
+        return {}
+
+    tf["lm_loss"] /= float(model.config.halt_max_steps)
+    return {f"test/{k}": tf[k] / count for k in tf if k != "count"}
+
+
+def make_eval_step(max_steps: int):
+    max_steps = int(max_steps) + 1
+
+    @eqx.filter_jit
+    def evaluate_rollout(
+        model: Model, carry: Carry, rng: jnp.ndarray
+    ) -> Dict[str, jnp.ndarray]:
+        rngs = jax.random.split(rng, max_steps)
+
+        def step_fn(state, rng_step):
+            carry_in, finished_in = state
+            warmed = model.warmup_carry(carry_in)
+            carry_out, _loss, metrics_out, all_finish = act_loss(
+                model, warmed, rng=rng_step, training=False
+            )
+            metrics_masked = jtu.tree_map(
+                lambda x: jnp.where(finished_in, jnp.zeros_like(x), x), metrics_out
+            )
+            finished_out = jnp.logical_or(finished_in, all_finish)
+            return (carry_out, finished_out), metrics_masked
+
+        (_, _), metrics_seq = jax.lax.scan(step_fn, (carry, jnp.array(False)), rngs)
+        return jtu.tree_map(lambda x: jnp.sum(x, axis=0), metrics_seq)
+
+    def eval_step(model, batch_data, rng):
+        carry = model.initial_carry(batch_data)
+        carry = filter_carry(model, carry, batch_data)
+        metrics = evaluate_rollout(model, carry, rng)
+        return jax.tree.map(lambda x: jax.lax.psum(x, axis_name="devices"), metrics)
+
+    return jax.pmap(eval_step, axis_name="devices")
 
 
 def make_train_step(optimizer, param_labels, clipper):
@@ -276,11 +364,14 @@ def main(config: TrainConfig = TrainConfig()):
     per_device_batch = config.global_batch_size // num_devices
     global_batch_size = config.global_batch_size
 
+    train_epochs_per_iter = config.eval_every
+    total_iters = config.epochs // train_epochs_per_iter
+
     train_loader, train_metadata = create_dataloader(
         config,
         "train",
         test_set_mode=False,
-        epochs_per_iter=config.epochs,
+        epochs_per_iter=train_epochs_per_iter,
         global_batch_size=global_batch_size,
         rank=0,
         world_size=1,
@@ -290,7 +381,7 @@ def main(config: TrainConfig = TrainConfig()):
         "test",
         test_set_mode=True,
         epochs_per_iter=1,
-        global_batch_size=per_device_batch,
+        global_batch_size=global_batch_size,
         rank=0,
         world_size=1,
     )
@@ -329,9 +420,6 @@ def main(config: TrainConfig = TrainConfig()):
         settings=wandb.Settings(_disable_stats=True),
     )
 
-    def unreplicate(tree):
-        return jax.tree.map(lambda x: x[0], tree)
-
     params_host = unreplicate(train_state.params)
     ema_helper = EMAHelper(mu=config.ema_rate)
     ema_helper.register(eqx.combine(params_host, static_host))
@@ -344,82 +432,73 @@ def main(config: TrainConfig = TrainConfig()):
         model = eqx.combine(params, static_model)
         return model.initial_carry(batch)
 
-    for _, batch, _ in train_loader:
+    for _ in range(total_iters):
+        for _, batch, _ in train_loader:
+            if train_state.step >= train_state.total_steps:
+                break
+
+            batch_jnp = batch_to_jnp(batch)
+            batch_sharded = shard_batch(batch_jnp, num_devices, per_device_batch)
+
+            if train_state.carry is None:
+                train_state.carry = init_carry(
+                    train_state.params, train_state.static, batch_sharded
+                )
+
+            lr_main = compute_lr(config.lr, config, train_state)
+            lr_task = compute_lr(config.task_emb_lr, config, train_state)
+            rngs = jax.random.split(train_state.rng, num_devices + 1)
+            rng, step_rng = rngs[0], jnp.stack(rngs[1:])
+
+            (
+                new_params,
+                train_state.opt_state,
+                train_state.carry,
+                loss,
+                metrics,
+            ) = train_step(
+                train_state.params,
+                train_state.opt_state,
+                train_state.carry,
+                batch_sharded,
+                jax.device_put_replicated(
+                    jnp.asarray(per_device_batch, dtype=jnp.float32), devices
+                ),
+                step_rng,
+                jax.device_put_replicated(lr_main, devices),
+                jax.device_put_replicated(lr_task, devices),
+                train_state.static,
+            )
+            train_state.params = new_params
+            train_state.step += 1
+            train_state.rng = rng
+
+            params_host = unreplicate(train_state.params)
+            ema_helper.update(eqx.combine(params_host, static_host))
+
+            metrics_host = unreplicate(metrics)
+            log_metrics(metrics_host, lr_main, lr_task, train_state.step, config)
+
+            progress_bar.update(train_state.step - progress_bar.n)
+
         if train_state.step >= train_state.total_steps:
             break
 
-        batch_jnp = batch_to_jnp(batch)
-        batch_sharded = shard_batch(batch_jnp, num_devices, per_device_batch)
-
-        if train_state.carry is None:
-            train_state.carry = init_carry(
-                train_state.params, train_state.static, batch_sharded
-            )
-
-        lr_main = compute_lr(config.lr, config, train_state)
-        lr_task = compute_lr(config.task_emb_lr, config, train_state)
-        rngs = jax.random.split(train_state.rng, num_devices + 1)
-        rng, step_rng = rngs[0], jnp.stack(rngs[1:])
-
-        (
-            new_params,
-            train_state.opt_state,
-            train_state.carry,
-            loss,
-            metrics,
-        ) = train_step(
-            train_state.params,
-            train_state.opt_state,
-            train_state.carry,
-            batch_sharded,
-            jax.device_put_replicated(
-                jnp.asarray(per_device_batch, dtype=jnp.float32), devices
-            ),
-            step_rng,
-            jax.device_put_replicated(lr_main, devices),
-            jax.device_put_replicated(lr_task, devices),
-            train_state.static,
+        eval_model = ema_helper.ema_copy()
+        eval_rng, eval_step_rng = jax.random.split(eval_rng)
+        eval_logs = evaluate_model(
+            eval_model,
+            test_loader_iter,
+            rng=eval_step_rng,
+            num_batches=config.eval_batches,
+            devices=devices,
+            per_device_batch=per_device_batch,
         )
-        train_state.params = new_params
-        train_state.step += 1
-        train_state.rng = rng
+        wandb.log(eval_logs, step=train_state.step)
 
-        params_host = unreplicate(train_state.params)
-        ema_helper.update(eqx.combine(params_host, static_host))
-
-        metric_values = {k: float(v[0]) for k, v in metrics.items()}
-        if len(metric_values):
-            count = max(metric_values.get("count", 1.0), 1.0)
-            logged = {
-                f"train/{k}": metric_values[k]
-                / (config.global_batch_size if k.endswith("loss") else count)
-                for k in metric_values
-            }
-            logged["train/lr"] = float(lr_main)
-            logged["train/task_lr"] = float(lr_task)
-            wandb.log(logged, step=train_state.step)
-            progress_bar.update(train_state.step - progress_bar.n)
-
-        if config.eval_every > 0 and train_state.step % config.eval_every == 0:
-            eval_model = ema_helper.ema_copy()
-            eval_rng, eval_step_rng = jax.random.split(eval_rng)
-            eval_batches = [next(test_loader_iter) for _ in range(config.eval_batches)]
-            eval_logs = evaluate_model(
-                eval_model,
-                eval_batches,
-                batch_converter=batch_to_jnp,
-                filter_carry_fn=filter_carry,
-                rng=eval_step_rng,
-            )
-            wandb.log(eval_logs, step=train_state.step)
-
-        if (
-            config.checkpoint_every > 0
-            and train_state.step % config.checkpoint_every == 0
-        ):
-            os.makedirs("checkpoints", exist_ok=True)
-            ckpt_path = os.path.join("checkpoints", f"{config.run_name}.eqx")
-            eqx.tree_serialise_leaves(ckpt_path, eqx.combine(params_host, static_host))
+        os.makedirs("checkpoints", exist_ok=True)
+        ckpt_path = os.path.join("checkpoints", f"{config.run_name}.eqx")
+        eqx.tree_serialise_leaves(ckpt_path, eqx.combine(params_host, static_host))
 
     wandb.finish()
 
