@@ -18,12 +18,7 @@ def act_loss(
 ) -> Tuple[
     Carry, jnp.ndarray, Dict[str, jnp.ndarray], Dict[str, jnp.ndarray], jnp.ndarray
 ]:
-    new_carry, outputs = model(
-        carry,
-        rng=rng,
-        training=training,
-        record=False,
-    )
+    new_carry, outputs = model(carry, rng=rng, training=training)
 
     labels = new_carry.data["labels"]
     y_logits = outputs["y_logits"]
@@ -92,6 +87,3 @@ def stablemax_cross_entropy(
     labels = jnp.where(valid_mask, labels, 0)
     pred_logprobs = jnp.take_along_axis(logprobs, labels[..., None], axis=-1)
     return -jnp.where(valid_mask, pred_logprobs.squeeze(-1), 0.0)
-
-
-

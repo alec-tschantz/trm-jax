@@ -1,4 +1,3 @@
-import math
 import os
 from dataclasses import dataclass
 from typing import Dict
@@ -15,7 +14,7 @@ import wandb
 from torch.utils.data import DataLoader
 
 from dataset import Dataset, DatasetConfig, DatasetMetadata
-from evaluate import evaluate_model, evaluate_logit_lens
+from evaluate import evaluate_model
 from trm.losses import act_loss
 from trm.model import Carry, Model, ModelConfig
 from trm.optim import adam_atan2, sparse_sign_sgd, cosine_warmup_schedule
@@ -41,8 +40,7 @@ class TrainConfig:
     seed: int = 0
     ema_rate: float = 0.999
     eval_every: int = 1000
-    logit_lens_every: int = 250
-    eval_batches: int = 10
+    eval_batches: int = 32
     checkpoint_every: int = 0
     halt_exploration_prob: float = 0.1
     halt_max_steps: int = 16
@@ -222,7 +220,7 @@ def filter_carry(model: Model, carry: Carry, batch: Dict[str, jnp.ndarray]) -> C
     )
 
 
-def make_train_step(static_model, optimizer, param_labels, clipper):
+def make_train_step(optimizer, param_labels, clipper):
     def train_step_fn(
         params,
         opt_state,
@@ -236,11 +234,14 @@ def make_train_step(static_model, optimizer, param_labels, clipper):
     ):
         lb = jnp.asarray(local_batch_size, dtype=jnp.float32)
 
+        model_for_warmup = eqx.combine(params, static_repl)
+        filtered_carry = filter_carry(model_for_warmup, carry, batch_data)
+        warmed_carry = model_for_warmup.warmup_carry(filtered_carry)
+
         def loss_fn(p):
             model = eqx.combine(p, static_repl)
-            inp_carry = filter_carry(model, carry, batch_data)
             new_carry, loss, metrics, _ = act_loss(
-                model, inp_carry, rng=rng, training=True
+                model, warmed_carry, rng=rng, training=True
             )
             return loss / lb, (new_carry, metrics, loss)
 
@@ -297,8 +298,8 @@ def main(config: TrainConfig = TrainConfig()):
     test_loader_iter = infinite_dataloader(test_loader)
 
     rng = jax.random.PRNGKey(config.seed)
-    rngs = jax.random.split(rng, 5)
-    rng, model_key, train_key, eval_rng, logit_lens_rng = rngs
+    rngs = jax.random.split(rng, 4)
+    rng, model_key, train_key, eval_rng = rngs
 
     train_state, optimizer, param_labels = create_train_state(
         config,
@@ -336,7 +337,7 @@ def main(config: TrainConfig = TrainConfig()):
     ema_helper.register(eqx.combine(params_host, static_host))
     clipper = optax.clip_by_global_norm(config.grad_clip_norm)
 
-    train_step = make_train_step(train_state.static, optimizer, param_labels, clipper)
+    train_step = make_train_step(optimizer, param_labels, clipper)
 
     @jax.pmap
     def init_carry(params, static_model, batch):
@@ -411,34 +412,6 @@ def main(config: TrainConfig = TrainConfig()):
                 rng=eval_step_rng,
             )
             wandb.log(eval_logs, step=train_state.step)
-
-        if (
-            config.logit_lens_every > 0
-            and train_state.step % config.logit_lens_every == 0
-        ):
-            lens_model = ema_helper.ema_copy()
-            evaluate_logit_lens(
-                lens_model,
-                {k: v[:per_device_batch] for k, v in batch_jnp.items()},
-                train_metadata,
-                filter_carry_fn=filter_carry,
-                step=train_state.step,
-                rng=logit_lens_rng,
-                log_prefix="logit_lens/train",
-            )
-
-            _, sampled_batch, _ = next(test_loader_iter)
-            test_batch = batch_to_jnp(sampled_batch)
-            logit_lens_rng, lens_step_rng = jax.random.split(logit_lens_rng)
-            evaluate_logit_lens(
-                lens_model,
-                test_batch,
-                test_metadata,
-                filter_carry_fn=filter_carry,
-                step=train_state.step,
-                rng=lens_step_rng,
-                log_prefix="logit_lens/test",
-            )
 
         if (
             config.checkpoint_every > 0

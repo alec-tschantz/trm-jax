@@ -61,8 +61,8 @@ class Model(eqx.Module):
     forward_dtype: jnp.dtype = eqx.field(static=True)
     embed_scale: float = eqx.field(static=True)
     task_emb_len: int = eqx.field(static=True)
-    H_init: jnp.ndarray = eqx.field(static=True)
-    L_init: jnp.ndarray = eqx.field(static=True)
+    y_init: jnp.ndarray = eqx.field(static=True)
+    z_init: jnp.ndarray = eqx.field(static=True)
 
     embed_tokens: Embedding
     lm_head: Linear
@@ -126,33 +126,25 @@ class Model(eqx.Module):
             )
         )
 
-        self.H_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
-        self.L_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
+        self.y_init = trunc_normal(k6, (config.hidden_size,), std=1.0).astype(dtype)
+        self.z_init = trunc_normal(k7, (config.hidden_size,), std=1.0).astype(dtype)
 
     def __call__(
         self,
         carry: Carry,
         rng: jnp.ndarray,
         training: bool,
-        *,
-        record: bool = False,
     ):
         batch = carry.data
         cos_sin = self.rotary_emb()
         x_embed = self.embed_inputs(batch["inputs"], batch["puzzle_identifiers"])
 
-        y, z, iters_aux = self.run_iters(
-            x_embed,
-            carry.states.y,
-            carry.states.z,
-            cos_sin,
-            record=record,
-        )
+        y, z = self.y_z_iteration(x_embed, carry.states.y, carry.states.z, cos_sin)
 
         y_logits = self.lm_head(y).astype(jnp.float32)[:, self.task_emb_len :, :]
         q_logits = self.q_head(y[:, 0]).astype(jnp.float32).squeeze(-1)
 
-        q_rng, rng = jax.random.split(rng)
+        q_rng, _ = jax.random.split(rng)
         new_steps, halted = self.update_halt_state(
             carry.steps, q_logits, q_rng, training
         )
@@ -166,29 +158,51 @@ class Model(eqx.Module):
             halted=halted,
             data=carry.data,
         )
-        aux = {**iters_aux, "y_logits": y_logits, "q_logits": q_logits}
+        aux = {"y_logits": y_logits, "q_logits": q_logits}
         return carry, aux
 
-    def run_iters(self, x_embed, y, z, cos_sin, *, record=False):
-        x_embed = x_embed.astype(self.forward_dtype)
-        y0, z0 = y.astype(self.forward_dtype), z.astype(self.forward_dtype)
-        is_last = jnp.arange(self.config.y_cycles) == (self.config.y_cycles - 1)
+    def warmup_carry(self, carry: Carry) -> Carry:
+        num_warmup = self.config.y_cycles - 1
 
-        def body(carry, last):
-            y_curr, z_curr = carry
-            z_next, z_hist = self.run_z_iters(
-                x_embed, y_curr, z_curr, cos_sin, record=record
-            )
-            y_next = self.network(y_curr, z_next, cos_sin).astype(self.forward_dtype)
-            y_c = jax.lax.cond(last, lambda x: x, jax.lax.stop_gradient, y_next)
-            z_c = jax.lax.cond(last, lambda x: x, jax.lax.stop_gradient, z_next)
-            hist = (jax.lax.stop_gradient(y_next), z_hist) if record else None
-            return (y_c, z_c), hist
+        batch = carry.data
+        cos_sin = self.rotary_emb()
+        x_embed = self.embed_inputs(batch["inputs"], batch["puzzle_identifiers"])
 
-        (y_final, z_final), hist = jax.lax.scan(body, (y0, z0), is_last)
-        y_hist, z_hist = hist if record else (None, None)
+        def body(states, _):
+            y_state, z_state = states
+            y_next, z_next = self.y_z_iteration(x_embed, y_state, z_state, cos_sin)
+            return (
+                jax.lax.stop_gradient(y_next),
+                jax.lax.stop_gradient(z_next),
+            ), None
 
-        return y_final, z_final, {"y_hist": y_hist, "z_hist": z_hist}
+        (y_final, z_final), _ = jax.lax.scan(
+            body,
+            (carry.states.y, carry.states.z),
+            xs=None,
+            length=num_warmup,
+        )
+
+        return Carry(
+            states=State(y=y_final, z=z_final),
+            steps=carry.steps,
+            halted=carry.halted,
+            data=carry.data,
+        )
+
+    def y_z_iteration(
+        self,
+        x_embed: jnp.ndarray,
+        y_state: jnp.ndarray,
+        z_state: jnp.ndarray,
+        cos_sin: CosSin,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        z_next = self.run_z_iters(x_embed, y_state, z_state, cos_sin)
+        y_next = self.network(y_state.astype(self.forward_dtype), z_next, cos_sin)
+        return (
+            y_next.astype(self.forward_dtype),
+            z_next.astype(self.forward_dtype),
+        )
 
     def run_z_iters(
         self,
@@ -196,19 +210,19 @@ class Model(eqx.Module):
         y_state: jnp.ndarray,
         z_state: jnp.ndarray,
         cos_sin: CosSin,
-        *,
-        record: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        def body(z_curr, _):
-            context = (y_state + x_embed).astype(self.forward_dtype)
-            z_next = self.network(z_curr, context, cos_sin).astype(self.forward_dtype)
-            hist = jax.lax.stop_gradient(z_next) if record else None
-            return z_next, hist
+    ) -> jnp.ndarray:
+        x_embed = x_embed.astype(self.forward_dtype)
+        y_state = y_state.astype(self.forward_dtype)
+        z_state = z_state.astype(self.forward_dtype)
+        context = (y_state + x_embed).astype(self.forward_dtype)
+        net = eqx.filter_checkpoint(self.network)
 
-        z_final, z_hist = jax.lax.scan(
-            body, z_state, xs=None, length=self.config.z_cycles
-        )
-        return z_final, z_hist
+        def body(z_curr, _):
+            z_next = net(z_curr, context, cos_sin).astype(self.forward_dtype)
+            return z_next, None
+
+        z_final, _ = jax.lax.scan(body, z_state, xs=None, length=self.config.z_cycles)
+        return z_final
 
     def embed_inputs(self, inputs: jnp.ndarray, task_ids: jnp.ndarray) -> jnp.ndarray:
         tok = self.embed_tokens(inputs.astype(jnp.int32))
@@ -256,8 +270,8 @@ class Model(eqx.Module):
 
     def reset_states(self, reset: jnp.ndarray, states: State) -> State:
         flag = reset.reshape((-1, 1, 1))
-        y0 = self.H_init[None, None, :]
-        z0 = self.L_init[None, None, :]
+        y0 = self.y_init[None, None, :]
+        z0 = self.z_init[None, None, :]
         y = jnp.where(flag, y0, states.y)
         z = jnp.where(flag, z0, states.z)
         return State(y=y, z=z)
