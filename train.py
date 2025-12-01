@@ -94,7 +94,7 @@ def create_model(
 
     def build_param_labels(p):
         labels = jtu.tree_map(lambda _: 0, p)
-        labels = eqx.tree_at(lambda tree: tree.task_embed.weight, labels, 1)
+        labels = eqx.tree_at(lambda tree: tree.encoder.task_embed.weight, labels, 1)
         return labels
 
     param_labels = build_param_labels(params)
@@ -287,14 +287,18 @@ def make_eval_step(max_steps: int):
         def step_fn(state, rng_step):
             carry_in, finished_in = state
             warmed = model.warmup_carry(carry_in)
-            carry_out, _loss, metrics_out, all_finish = act_loss(
-                model, warmed, rng=rng_step, training=False
+            carry_out, outputs = model(warmed, rng=rng_step, training=False)
+            loss_carry, _loss, metrics_out, all_finish = act_loss(
+                carry_out,
+                outputs["y_logits"],
+                outputs["q_logits"],
+                warmed.data["labels"],
             )
             metrics_masked = jtu.tree_map(
                 lambda x: jnp.where(finished_in, jnp.zeros_like(x), x), metrics_out
             )
             finished_out = jnp.logical_or(finished_in, all_finish)
-            return (carry_out, finished_out), metrics_masked
+            return (loss_carry, finished_out), metrics_masked
 
         (_, _), metrics_seq = jax.lax.scan(step_fn, (carry, jnp.array(False)), rngs)
         return jtu.tree_map(lambda x: jnp.sum(x, axis=0), metrics_seq)
@@ -328,10 +332,14 @@ def make_train_step(optimizer, param_labels, clipper):
 
         def loss_fn(p):
             model = eqx.combine(p, static_repl)
-            new_carry, loss, metrics, _ = act_loss(
-                model, warmed_carry, rng=rng, training=True
+            new_carry, outputs = model(warmed_carry, rng=rng, training=True)
+            loss_carry, loss, metrics, _ = act_loss(
+                new_carry,
+                outputs["y_logits"],
+                outputs["q_logits"],
+                warmed_carry.data["labels"],
             )
-            return loss / lb, (new_carry, metrics, loss)
+            return loss / lb, (loss_carry, metrics, loss)
 
         (loss, (new_carry, metrics, unscaled_loss)), grads = eqx.filter_value_and_grad(
             loss_fn, has_aux=True

@@ -1,35 +1,27 @@
-from typing import Dict, Tuple
+from typing import Dict
 
 import jax.nn as jnn
 import jax.numpy as jnp
 import optax
 
-from trm.model import Carry, Model
+from trm.model import Carry
 
 IGNORE_LABEL_ID = -100
 
 
 def act_loss(
-    model: Model,
     carry: Carry,
-    rng: jnp.ndarray,
-    *,
-    training: bool,
-) -> Tuple[
-    Carry, jnp.ndarray, Dict[str, jnp.ndarray], Dict[str, jnp.ndarray], jnp.ndarray
-]:
-    new_carry, outputs = model(carry, rng=rng, training=training)
-
-    labels = new_carry.data["labels"]
-    y_logits = outputs["y_logits"]
-    q_logits = outputs["q_logits"]
+    y_logits: jnp.ndarray,
+    q_logits: jnp.ndarray,
+    labels: jnp.ndarray,
+) -> tuple[Carry, jnp.ndarray, Dict[str, jnp.ndarray], jnp.ndarray]:
     preds = jnp.argmax(y_logits, axis=-1)
 
     metrics, mask, seq_is_correct, loss_divisor = compute_act_metrics(
         labels,
         preds,
         q_logits,
-        new_carry,
+        carry,
     )
     q_targets = seq_is_correct.astype(y_logits.dtype)
 
@@ -42,7 +34,7 @@ def act_loss(
     total_loss = lm_loss + 0.5 * q_halt_loss
 
     metrics = {**metrics, "lm_loss": lm_loss, "q_halt_loss": q_halt_loss}
-    return new_carry, total_loss, metrics, jnp.all(new_carry.halted)
+    return carry, total_loss, metrics, jnp.all(carry.halted)
 
 
 def compute_act_metrics(

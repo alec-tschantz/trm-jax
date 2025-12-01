@@ -126,7 +126,7 @@ class Dataset(IterableDataset):
                     set_name_ = set_name + str(i)
                 else:
                     set_name_ = set_name
-                self._data[set_name_] = {
+                set_data = {
                     field_name: np.load(
                         os.path.join(
                             dataset_path, self.split, f"{set_name}__{field_name}.npy"
@@ -135,6 +135,16 @@ class Dataset(IterableDataset):
                     )
                     for field_name, mmap_mode in field_mmap_modes.items()
                 }
+                puzzle_group_indices = (
+                    np.searchsorted(
+                        set_data["group_indices"],
+                        np.arange(set_data["puzzle_identifiers"].shape[0]),
+                        side="right",
+                    )
+                    - 1
+                ).astype(np.int32)
+                set_data["puzzle_group_indices"] = puzzle_group_indices
+                self._data[set_name_] = set_data
 
     def _collate_batch(self, batch):
         batch = {k: v.astype(np.int32) for k, v in batch.items()}
@@ -150,6 +160,7 @@ class Dataset(IterableDataset):
                 "inputs": self.metadata.pad_id,
                 "labels": IGNORE_LABEL_ID,
                 "puzzle_identifiers": self.metadata.blank_identifier_id,
+                "puzzle_group_indices": 0,
             }
             batch = {
                 k: np.pad(
@@ -194,11 +205,15 @@ class Dataset(IterableDataset):
 
                     puzzle_indices.append(puzzle_index)
 
+                puzzle_indices = np.asarray(puzzle_indices, dtype=np.int32)
                 batch = self._collate_batch(
                     {
                         "inputs": dataset["inputs"][local_start:local_end],
                         "labels": dataset["labels"][local_start:local_end],
                         "puzzle_identifiers": dataset["puzzle_identifiers"][
+                            puzzle_indices
+                        ],
+                        "puzzle_group_indices": dataset["puzzle_group_indices"][
                             puzzle_indices
                         ],
                     }
@@ -254,6 +269,9 @@ class Dataset(IterableDataset):
                         "inputs": dataset["inputs"][batch_indices],
                         "labels": dataset["labels"][batch_indices],
                         "puzzle_identifiers": dataset["puzzle_identifiers"][
+                            batch_puzzle_indices
+                        ],
+                        "puzzle_group_indices": dataset["puzzle_group_indices"][
                             batch_puzzle_indices
                         ],
                     }

@@ -6,6 +6,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
+from trm.encoder import TaskEncoder
 from trm.utils import trunc_normal
 from trm.nn import (
     Block,
@@ -13,7 +14,6 @@ from trm.nn import (
     Embedding,
     Linear,
     RotaryEmbedding,
-    SparseEmbedding,
     Transformer,
 )
 
@@ -67,7 +67,7 @@ class Model(eqx.Module):
     embed_tokens: Embedding
     lm_head: Linear
     q_head: Linear
-    task_embed: SparseEmbedding
+    encoder: TaskEncoder
     rotary_emb: RotaryEmbedding
     network: Transformer
 
@@ -90,10 +90,11 @@ class Model(eqx.Module):
             cast_to=dtype,
         )
 
-        self.task_embed = SparseEmbedding(
-            config.num_task_identifiers,
-            config.task_emb_ndim,
-            init_std=0.0,
+        self.encoder = TaskEncoder(
+            num_task_identifiers=config.num_task_identifiers,
+            task_emb_ndim=config.task_emb_ndim,
+            task_emb_len=config.task_emb_len,
+            hidden_size=config.hidden_size,
             cast_to=dtype,
             key=k4,
         )
@@ -227,13 +228,8 @@ class Model(eqx.Module):
     def embed_inputs(self, inputs: jnp.ndarray, task_ids: jnp.ndarray) -> jnp.ndarray:
         tok = self.embed_tokens(inputs.astype(jnp.int32))
 
-        task = self.task_embed(task_ids)
-        need = self.task_emb_len * self.config.hidden_size - task.shape[-1]
-        if need > 0:
-            task = jnp.pad(task, ((0, 0), (0, need)))
-
-        task = task.reshape(-1, self.task_emb_len, self.config.hidden_size)
-        emb = jnp.concatenate([task, tok], axis=1)
+        task_tokens = self.encoder(task_ids)
+        emb = jnp.concatenate([task_tokens, tok], axis=1)
 
         emb = (emb * self.embed_scale).astype(self.forward_dtype)
         return emb
